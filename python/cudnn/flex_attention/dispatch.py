@@ -570,6 +570,7 @@ def _compile_flex_attn_fwd(
     """Compile or reuse the forward callable for a resolved launch."""
 
     kernel_compile_key = dispatch.compile_key + (
+        out.dtype,
         get_broadcast_dims(out),
         get_broadcast_dims(lse) if lse is not None else None,
         get_broadcast_dims(max_logit) if max_logit is not None else None,

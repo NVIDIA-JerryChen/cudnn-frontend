@@ -290,3 +290,12 @@ linked above measures the current Flex Attention implementation only.
 coordinates, planner stages, partial/full CSR topology, consumer-specific
 packed predicates, forward/backward consumption, and plan compatibility and
 ownership.
+
+### FP32 outputs for split attention
+
+The explicit `FlexAttentionFwd` API accepts a preallocated FP32 output tensor
+in addition to the input dtype. This preserves partial-output precision when
+multiple disjoint interval plans are combined by a caller. LSE remains FP32
+with layout `[B, Hq, Sq]` for fixed-length inputs. The output dtype is part of
+the compiled kernel cache key. The high-level wrapper retains its input-dtype
+output convention.

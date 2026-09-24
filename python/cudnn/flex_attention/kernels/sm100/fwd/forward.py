@@ -178,6 +178,12 @@ class _FlexAttentionForwardSm100Base:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
+        # Q-stage 2 holds V_i until both PV operations finish while requesting
+        # K_{i+1} between them, so it needs at least two KV buffers. FP32 partial
+        # outputs at D128 otherwise leave room for only one. Reuse Q storage
+        # after its final MMA, with the existing load/epilogue handoff.
+        if not self.n_direction_qstage1 and self.o_dtype == Float32 and self.head_dim_v_padded >= 128:
+            self.overlap_sO_sQ = True
         smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
         smem_size_o = self.output_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)

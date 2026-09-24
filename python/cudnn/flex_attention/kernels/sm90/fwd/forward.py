@@ -72,7 +72,7 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             cute.struct.MemRange[self.dtype, cute.cosize(self.sK_layout)],
             self.buffer_align_bytes,
         ]
-        cosize_sVO = max(cute.cosize(self.sV_layout), cute.cosize(self.sO_layout))
+        cosize_sVO = max(cute.cosize(self.sV_layout), cute.cosize(self.sO_layout) * self.o_dtype.width // self.dtype.width)
         sVO_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sVO], self.buffer_align_bytes]
         sQ_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(self.sQ_layout)], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
@@ -131,6 +131,11 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
 
+        self.o_dtype = mO.element_type
+        # D256 FP32 O needs 128 KiB. One K/V stage keeps shared storage
+        # below Hopper's 227 KiB limit without changing the planner's tiles.
+        if const_expr(self.o_dtype == Float32 and self.tile_hdim == 256 and self.tile_hdimv == 256):
+            self.num_stages = 1
         self._check_type(*(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mMaxLogit, mCuSeqlensQ, mCuSeqlensK)))
 
         assert blocksparse_tensors is not None
@@ -374,7 +379,8 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        sO = storage.sV.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        # The TMA tensor contains coordinates; retain O's declared scalar dtype.
+        sO = storage.sV.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.o_dtype)
         # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
         sVt = layout_utils.transpose_view(sV)
         sP = None

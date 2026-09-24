@@ -282,8 +282,8 @@ class FlexAttentionFwd(APIBase):
                 raise ValueError(f"max_logit must be contiguous, have shape ({dispatch.num_q_heads},), dtype torch.float32, and be on {self._sample_q.device}")
         if dispatch.total_q == 0 or dispatch.total_k == 0:
             raise ValueError("FlexAttentionFwd APIBase requires non-empty sample tensors")
-        if tuple(self._sample_o.shape) != dispatch.output_shape or self._sample_o.dtype != self._sample_q.dtype:
-            raise ValueError(f"o must have shape {dispatch.output_shape} and dtype {self._sample_q.dtype}")
+        if tuple(self._sample_o.shape) != dispatch.output_shape or self._sample_o.dtype not in (self._sample_q.dtype, torch.float32):
+            raise ValueError(f"o must have shape {dispatch.output_shape} and dtype {self._sample_q.dtype} or torch.float32")
         if self._sample_lse is not None and (tuple(self._sample_lse.shape) != dispatch.lse_shape or self._sample_lse.dtype != torch.float32):
             raise ValueError(f"lse must have shape {dispatch.lse_shape} and dtype torch.float32")
         self._dispatch_compile_key = dispatch.compile_key
