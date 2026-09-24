@@ -13,6 +13,8 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
+from cudnn.flex_attention.kernels.common.communication import fence_proxy_async_global, publish_dkv_done, wait_kv_ready
+from cudnn.flex_attention.kernels.common.prepared_backward_scheduler import PreparedBackwardScheduler
 from cudnn.flex_attention._compat import copy_utils
 from cudnn.flex_attention._compat import layout_utils
 from cudnn.flex_attention._compat import sm90_utils
@@ -448,7 +450,11 @@ class FlexAttentionBackwardSm90:
             head_swizzle=self.deterministic,
         )
 
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        if const_expr(blocksparse_tensors.bwd_work_desc is not None):
+            TileScheduler = PreparedBackwardScheduler
+            tile_sched_params = TileScheduler.to_underlying_arguments(blocksparse_tensors.bwd_work_desc, blocksparse_tensors.bwd_work_state, 1)
+        else:
+            tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
         LOG2_E = math.log2(math.e)
@@ -757,6 +763,16 @@ class FlexAttentionBackwardSm90:
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (None,))
                 gdPsum = cute.local_tile(mdPsum_cur, (self.tile_m,), (None,))
 
+                if const_expr(blocksparse_tensors.kv_ready is not None):
+                    wait_kv_ready(
+                        blocksparse_tensors.kv_ready,
+                        head_idx_kv,
+                        n_block * self.tile_n,
+                        self.tile_n,
+                        seqlen.seqlen_k,
+                        self.comm_block_size,
+                    )
+
                 load_K, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gK, sK, single_stage=True)
                 load_V, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gV, sV, single_stage=True)
                 load_Q, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), gQ, sQ)
@@ -1024,6 +1040,24 @@ class FlexAttentionBackwardSm90:
                     mdV_semaphore,
                 )
 
+            if const_expr(blocksparse_tensors.dkv_done is not None):
+                if cute.arch.warp_idx() == 4:
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+                    with cute.arch.elect_one():
+                        fence_proxy_async_global()
+                cutlass.pipeline.NamedBarrier(barrier_id=int(NamedBarrierBwd.Epilogue), num_threads=self.num_mma_threads).arrive_and_wait()
+                if tidx == 0:
+                    publish_dkv_done(
+                        blocksparse_tensors.dkv_done,
+                        blocksparse_tensors.dkv_expected,
+                        blocksparse_tensors.dkv_completed,
+                        blocksparse_tensors.dkv_completed_count,
+                        head_idx // self.qhead_per_kvhead,
+                        n_block * self.tile_n,
+                        self.tile_n,
+                        seqlen.seqlen_k,
+                        self.dkv_block_size,
+                    )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 

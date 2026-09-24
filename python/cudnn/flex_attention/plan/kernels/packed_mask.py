@@ -1820,8 +1820,15 @@ def get_curr_dq_write_order_bwd(
     if const_expr(cu_total_k_blocks is not None):
         outer_row = cu_total_k_blocks[batch_idx] + n_block
     offset_idx = plan_head * mask_block_cnt.shape[1] + outer_row
-    curr_dq_write_order = cute.domain_offset(mask_block_offset[offset_idx], blocksparse_tensors.dq_write_order)
-    curr_dq_write_order_full = cute.domain_offset(full_block_offset[offset_idx], blocksparse_tensors.dq_write_order_full)
+    if const_expr(blocksparse_tensors.bwd_dq_order is not None):
+        order_head = Int32(0) if blocksparse_tensors.bwd_dq_order.shape[0] == 1 else head_idx
+        partial_order = blocksparse_tensors.bwd_dq_order[order_head, None]
+        full_order = blocksparse_tensors.bwd_dq_order_full[order_head, None]
+    else:
+        partial_order = blocksparse_tensors.dq_write_order
+        full_order = blocksparse_tensors.dq_write_order_full
+    curr_dq_write_order = cute.domain_offset(mask_block_offset[offset_idx], partial_order)
+    curr_dq_write_order_full = cute.domain_offset(full_block_offset[offset_idx], full_order)
     return curr_dq_write_order, curr_dq_write_order_full
 
 
@@ -2257,8 +2264,15 @@ def dQaccum_store_block_sparse_bwd_sm90(
     if const_expr(deterministic):
         assert blocksparse_tensors.dq_write_order is not None
         assert blocksparse_tensors.dq_write_order_full is not None
-        curr_dq_write_order = cute.domain_offset(partial_base, blocksparse_tensors.dq_write_order)
-        curr_dq_write_order_full = cute.domain_offset(full_base, blocksparse_tensors.dq_write_order_full)
+        if const_expr(blocksparse_tensors.bwd_dq_order is not None):
+            order_head = Int32(0) if blocksparse_tensors.bwd_dq_order.shape[0] == 1 else head_idx
+            partial_order = blocksparse_tensors.bwd_dq_order[order_head, None]
+            full_order = blocksparse_tensors.bwd_dq_order_full[order_head, None]
+        else:
+            partial_order = blocksparse_tensors.dq_write_order
+            full_order = blocksparse_tensors.dq_write_order_full
+        curr_dq_write_order = cute.domain_offset(partial_base, partial_order)
+        curr_dq_write_order_full = cute.domain_offset(full_base, full_order)
         assert curr_dq_write_order is not None
 
     for sparse_idx in cutlass.range(curr_q_cnt, unroll=1):

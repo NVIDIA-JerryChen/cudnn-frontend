@@ -599,6 +599,125 @@ class MaskPlan:
     def metadata(self) -> MaskPlanMetadata:
         return self._metadata
 
+    def with_kv_ready(self, ready: torch.Tensor, *, block_size: int) -> MaskPlan:
+        """Bind system-acquire KV gates without changing interval topology.
+
+        The caller publishes a nonzero signal only after both K and V for that
+        communication block are visible, and resets signals before reuse. This
+        view and the caller own the signal storage; compiled caches do not.
+        """
+        import copy
+
+        metadata = self.metadata
+        if metadata.mode != "fixed" or metadata.batch_size != 1:
+            raise NotImplementedError("KV readiness currently requires fixed-length batch size 1")
+        if metadata.arch not in (90, 100, 103) or (metadata.arch != 90 and metadata.head_dim == 256):
+            raise NotImplementedError("KV readiness currently requires SM90 or generic SM100/SM103 kernels")
+        if type(block_size) is not int or block_size <= 0:
+            raise ValueError("communication block_size must be a positive integer")
+        blocks = (metadata.total_k + block_size - 1) // block_size
+        if ready.device != metadata.device or ready.dtype != torch.int32:
+            raise ValueError("KV ready signals must be int32 on the plan device")
+        if ready.ndim != 2 or ready.shape != (metadata.num_kv_heads, blocks) or ready.stride(-1) != 1:
+            raise ValueError(f"KV ready signals require [Hkv, communication blocks] = {(metadata.num_kv_heads, blocks)} with contiguous blocks")
+        updates = {"kv_ready": ready, "comm_block_size": block_size}
+        packed = self._packed_plan
+        if packed.bwd_tensors is not None:
+            updates["bwd_tensors"] = packed.bwd_tensors._replace(kv_ready=ready, comm_block_size=block_size)
+        bound = copy.copy(self)
+        bound._packed_plan = packed._replace(**updates)
+        return bound
+
+    def dkv_producer_counts(self, *, block_size: int) -> torch.Tensor:
+        """Prepare the number of active physical CTA writers per Hkv/K block.
+
+        K2Q activity belongs to a native cluster, so both physical halves count
+        even when a head is active in only one half. Ghost tail CTAs do not count.
+        This is a preparation operation and allocates its returned int32 tensor.
+        """
+        metadata = self.metadata
+        packed = self._packed_plan.bwd_tensors
+        if packed is None or metadata.mode != "fixed" or metadata.batch_size != 1:
+            raise NotImplementedError("dKV publication requires a backward plan for fixed-length batch size 1")
+        if metadata.arch not in (90, 100, 103) or (metadata.arch != 90 and metadata.head_dim == 256):
+            raise NotImplementedError("dKV publication currently requires SM90 or generic SM100/SM103 kernels")
+        tile = packed.block_size[1] if metadata.arch == 90 else packed.plan_signature.tile_n
+        if type(block_size) is not int or block_size <= 0 or (tile % block_size and block_size % tile):
+            raise ValueError(f"dKV block_size must divide or be a multiple of the physical KV tile ({tile})")
+        active = (packed.mask_block_cnt + packed.full_block_cnt) > 0
+        if metadata.arch == 90:
+            # SM90 executes a zero epilogue for inactive K2Q tasks, including
+            # ordered GQA reductions. Those writes must also precede publication.
+            active = torch.ones_like(active)
+        heads = metadata.num_q_heads
+        if active.shape[0] == 1:
+            active = active.expand(heads, -1)
+        native_tiles = (metadata.total_k + tile - 1) // tile
+        cluster_size = 1 if metadata.arch == 90 else packed.plan_signature.cta_group_size
+        physical = active.repeat_interleave(cluster_size, dim=-1)[:, :native_tiles]
+        counts = physical.reshape(metadata.num_kv_heads, heads // metadata.num_kv_heads, native_tiles).sum(1, dtype=torch.int32)
+        if block_size <= tile:
+            counts = counts.repeat_interleave(tile // block_size, dim=-1)
+        else:
+            group = block_size // tile
+            padding = (-native_tiles) % group
+            counts = torch.nn.functional.pad(counts, (0, padding)).reshape(metadata.num_kv_heads, -1, group).sum(-1, dtype=torch.int32)
+        return counts[:, : (metadata.total_k + block_size - 1) // block_size].contiguous()
+
+    def with_dkv_done(
+        self,
+        done: torch.Tensor,
+        *,
+        block_size: int,
+        expected: torch.Tensor | None = None,
+        completed: torch.Tensor | None = None,
+        completed_count: torch.Tensor | None = None,
+    ) -> MaskPlan:
+        """Bind backward system-release publication after physical tile writes.
+
+        GQA publishes raw FP32 accumulator completion, before conversion. The
+        caller must reset counters before execution. Optional completion flags
+        are incremented by the last writer, using ``dkv_producer_counts`` as
+        ``expected``. Zero-producer flags must be initialized by the caller.
+        """
+        import copy
+
+        metadata = self.metadata
+        packed = self._packed_plan.bwd_tensors
+        if packed is None or metadata.mode != "fixed" or metadata.batch_size != 1:
+            raise NotImplementedError("dKV publication requires a backward plan for fixed-length batch size 1")
+        if metadata.arch not in (90, 100, 103) or (metadata.arch != 90 and metadata.head_dim == 256):
+            raise NotImplementedError("dKV publication currently requires SM90 or generic SM100/SM103 kernels")
+        tile = packed.block_size[1] if metadata.arch == 90 else packed.plan_signature.tile_n
+        if type(block_size) is not int or block_size <= 0 or (tile % block_size and block_size % tile):
+            raise ValueError(f"dKV block_size must divide or be a multiple of the physical KV tile ({tile})")
+        shape = (metadata.num_kv_heads, (metadata.total_k + block_size - 1) // block_size)
+        if (expected is None, completed is None, completed_count is None).count(True) not in (0, 3):
+            raise ValueError("expected, completed and completed_count must be provided together")
+        for name, tensor in (("done", done), ("expected", expected), ("completed", completed), ("completed_count", completed_count)):
+            if tensor is None:
+                continue
+            expected_shape = (1,) if name == "completed_count" else shape
+            if tensor.device != metadata.device or tensor.dtype != torch.int32 or tuple(tensor.shape) != expected_shape or tensor.stride(-1) != 1:
+                raise ValueError(f"{name} requires int32 {expected_shape} on the plan device with contiguous blocks")
+        bound = copy.copy(self)
+        bound._packed_plan = self._packed_plan._replace(
+            bwd_tensors=packed._replace(
+                dkv_done=done,
+                dkv_expected=expected,
+                dkv_completed=completed,
+                dkv_completed_count=completed_count,
+                dkv_block_size=block_size,
+            )
+        )
+        return bound
+
+    @property
+    def backward_block_size(self) -> tuple[int, int] | None:
+        """Logical Q/KV token span, including cooperative CTA grouping."""
+        packed = self._packed_plan.bwd_tensors
+        return None if packed is None else packed.block_size
+
     def dkv_accumulator_permutations(self, *, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return natural-to-native scalar indices for one external dK/dV block.
 
@@ -667,6 +786,76 @@ class MaskPlan:
                 raise RuntimeError("native dKV accumulator mapping is not bijective")
             outputs[dimension] = permutation.to(torch.int32).contiguous()
         return outputs[metadata.head_dim], outputs[metadata.head_dim_v]
+
+    def with_backward_work_order(self, work: torch.Tensor, state: torch.Tensor) -> MaskPlan:
+        """Prepare native cluster/head work and matching deterministic dQ tickets.
+
+        ``work`` is a complete permutation of [KV cluster, Q head, batch] tasks.
+        Q heads sharing a KV head must appear in ascending order for each cluster.
+        ``state`` is caller-owned int32 [1 + tasks]: reset the cursor to zero and
+        the assignment slots to -1 before every execute. A resident cluster claims
+        a task from this cursor; physical CUDA block order carries no semantics.
+        This cold operation copies compact topology to the host, never a QxK mask.
+        """
+        import copy
+
+        metadata = self.metadata
+        packed = self._packed_plan.bwd_tensors
+        if packed is None or metadata.mode != "fixed" or metadata.batch_size != 1:
+            raise NotImplementedError("prepared backward work requires fixed batch size 1 and backward metadata")
+        if metadata.arch not in (90, 100, 103) or (metadata.arch != 90 and metadata.head_dim == 256):
+            raise NotImplementedError("prepared backward work currently requires SM90 or generic SM100/SM103 kernels")
+        clusters = packed.mask_block_cnt.shape[1]
+        heads = metadata.num_q_heads
+        tasks = clusters * heads
+        for name, tensor, shape in (("work", work, (tasks, 3)), ("state", state, (tasks + 1,))):
+            if tensor.device != metadata.device or tensor.dtype != torch.int32 or tuple(tensor.shape) != shape or not tensor.is_contiguous():
+                raise ValueError(f"{name} requires contiguous int32 {shape} on the plan device")
+        descriptors = [tuple(row) for row in work.cpu().tolist()]
+        wanted = {(cluster, head, 0) for cluster in range(clusters) for head in range(heads)}
+        if set(descriptors) != wanted:
+            raise ValueError("work must contain every native cluster/head/batch exactly once")
+        group = heads // metadata.num_kv_heads
+        next_head = {}
+        for cluster, head, _ in descriptors:
+            key = cluster, head // group
+            expected_head = next_head.get(key, head // group * group)
+            if head != expected_head:
+                raise ValueError("work must preserve ascending Q-head order within each cluster/KV-head group")
+            next_head[key] = expected_head + 1
+
+        mask_heads = packed.mask_block_cnt.shape[0]
+        order_heads = heads if mask_heads == 1 else 1
+        partial_order = torch.zeros((order_heads, packed.mask_block_idx.numel()), dtype=torch.int32)
+        full_order = torch.zeros((order_heads, packed.full_block_idx.numel()), dtype=torch.int32)
+        partial_offsets, full_offsets = packed.mask_block_offset.cpu().tolist(), packed.full_block_offset.cpu().tolist()
+        partial_counts, full_counts = packed.mask_block_cnt.cpu().tolist(), packed.full_block_cnt.cpu().tolist()
+        partial_indices, full_indices = packed.mask_block_idx.cpu().tolist(), packed.full_block_idx.cpu().tolist()
+        tickets = [{} for _ in range(heads)]
+        for cluster, head, _ in descriptors:
+            mask_head = 0 if mask_heads == 1 else head
+            order_head = head if mask_heads == 1 else 0
+            row = mask_head * clusters + cluster
+            for counts, offsets, indices, output in (
+                (partial_counts, partial_offsets, partial_indices, partial_order.numpy()),
+                (full_counts, full_offsets, full_indices, full_order.numpy()),
+            ):
+                start = offsets[row]
+                for entry in range(start, start + counts[mask_head][cluster]):
+                    q_block = indices[entry]
+                    ticket = tickets[head].get(q_block, 0)
+                    output[order_head, entry] = ticket
+                    tickets[head][q_block] = ticket + 1
+        bound = copy.copy(self)
+        bound._packed_plan = self._packed_plan._replace(
+            bwd_tensors=packed._replace(
+                bwd_work_desc=work.clone(),
+                bwd_work_state=state,
+                bwd_dq_order=partial_order.to(metadata.device),
+                bwd_dq_order_full=full_order.to(metadata.device),
+            )
+        )
+        return bound
 
     def debug_snapshot(self) -> dict[str, object]:
         """Return cloned tensors for diagnostics without exposing mutable plan state."""

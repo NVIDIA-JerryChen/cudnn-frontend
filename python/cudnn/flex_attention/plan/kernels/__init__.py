@@ -31,6 +31,15 @@ class BlockSparseTensors(NamedTuple):
     mask_block_masks: cute.Tensor | None = None
     sequence_desc: cute.Tensor | None = None
     fwd_work_desc: cute.Tensor | None = None
+    kv_ready: cute.Tensor | None = None
+    dkv_done: cute.Tensor | None = None
+    dkv_expected: cute.Tensor | None = None
+    dkv_completed: cute.Tensor | None = None
+    dkv_completed_count: cute.Tensor | None = None
+    bwd_work_desc: cute.Tensor | None = None
+    bwd_work_state: cute.Tensor | None = None
+    bwd_dq_order: cute.Tensor | None = None
+    bwd_dq_order_full: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -67,6 +76,17 @@ class BlockSparseTensorsTorch(NamedTuple):
     narrow_workset: bool | None = None
     sequence_desc: torch.Tensor | None = None
     fwd_work_desc: torch.Tensor | None = None
+    kv_ready: torch.Tensor | None = None
+    comm_block_size: int = 0
+    dkv_done: torch.Tensor | None = None
+    dkv_expected: torch.Tensor | None = None
+    dkv_completed: torch.Tensor | None = None
+    dkv_completed_count: torch.Tensor | None = None
+    dkv_block_size: int = 0
+    bwd_work_desc: torch.Tensor | None = None
+    bwd_work_state: torch.Tensor | None = None
+    bwd_dq_order: torch.Tensor | None = None
+    bwd_dq_order_full: torch.Tensor | None = None
 
 
 def _validate_required_tensors(
@@ -369,4 +389,13 @@ def to_cute_block_sparse_tensors(
         convert(tensors.mask_block_masks, align=16),
         convert(tensors.sequence_desc, align=16),
         convert(tensors.fwd_work_desc, align=16),
+        convert(tensors.kv_ready),
+        convert(tensors.dkv_done),
+        convert(tensors.dkv_expected),
+        convert(tensors.dkv_completed),
+        convert(tensors.dkv_completed_count),
+        convert(tensors.bwd_work_desc),
+        convert(tensors.bwd_work_state),
+        convert(tensors.bwd_dq_order),
+        convert(tensors.bwd_dq_order_full),
     )

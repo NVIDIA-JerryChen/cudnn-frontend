@@ -16,6 +16,7 @@ from cutlass.utils import LayoutEnum
 
 import cuda.bindings.driver as cuda
 
+from cudnn.flex_attention.kernels.common.communication import wait_kv_ready
 from cudnn.flex_attention._compat import copy_utils
 from cudnn.flex_attention._compat import layout_utils
 from cudnn.flex_attention._compat import sm90_utils
@@ -475,6 +476,20 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
             )
 
     @cute.jit
+    def load_ready_k(
+        self,
+        load_K: Callable,
+        src_idx: Int32,
+        producer_state: pipeline.PipelineState,
+        ready: cute.Tensor | None,
+        head: Int32,
+        valid_tokens: Int32,
+    ):
+        if const_expr(ready is not None):
+            wait_kv_ready(ready, head, src_idx * self.tile_n, self.tile_n, valid_tokens, self.comm_block_size)
+        load_K(src_idx=src_idx, producer_state=producer_state)
+
+    @cute.jit
     def load(
         self,
         mQ: cute.Tensor,
@@ -522,7 +537,13 @@ class FlexAttentionForwardSm90(FlexAttentionForwardBase):
                 gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                 tma_load_K_fn, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gK, sK)
-                tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
+                tma_load_K_fn = partial(
+                    self.load_ready_k,
+                    copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k),
+                    ready=blocksparse_tensors.kv_ready,
+                    head=head_idx_kv,
+                    valid_tokens=seqlen.seqlen_k,
+                )
                 tma_load_V_fn, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gV, sV)
                 tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_v)
 

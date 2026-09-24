@@ -158,6 +158,15 @@ def _block_sparse_runtime_tuple(tensors):
         tensors.mask_block_masks,
         tensors.sequence_desc,
         tensors.fwd_work_desc,
+        tensors.kv_ready,
+        tensors.dkv_done,
+        tensors.dkv_expected,
+        tensors.dkv_completed,
+        tensors.dkv_completed_count,
+        tensors.bwd_work_desc,
+        tensors.bwd_work_state,
+        tensors.bwd_dq_order,
+        tensors.bwd_dq_order_full,
     )
 
 
@@ -523,6 +532,8 @@ def _prepare_flex_attn_fwd(
         cta_group_size,
         qstage1_overlap_pv_with_k_wait,
         use_smem_mask_pipeline,
+        normalized_plan.comm_block_size,
+        None if normalized_plan.kv_ready is None else get_broadcast_dims(normalized_plan.kv_ready),
     )
 
     return _FwdDispatch(
@@ -682,6 +693,7 @@ def _compile_flex_attn_fwd(
             current_stream,
         ]
         compile_options = "--enable-tvm-ffi"
+    kernel.comm_block_size = dispatch.normalized_plan.comm_block_size
     compiled_kernel = _compile_with_timing(
         *compile_args,
         options=compile_options,
@@ -1448,6 +1460,9 @@ def _flex_attn_bwd(
         dk_accum = _checked_preallocated(dk_accum_external, "dk_accum_external", dk_accum_shape, torch.float32, q.device)
         dv_accum = _checked_preallocated(dv_accum_external, "dv_accum_external", dv_accum_shape, torch.float32, q.device)
 
+    if block_sparse_tensors.bwd_tensors.dkv_done is not None and dkv_postprocess and dk_accum_external is None:
+        raise ValueError("dKV completion publishes native accumulators; declare external accumulators for this configuration")
+
     if _validate_only:
         return None
 
@@ -1580,6 +1595,17 @@ def _flex_attn_bwd(
         get_broadcast_dims(dk),
         get_broadcast_dims(dv),
         use_hd256,
+        tuple(
+            None if t is None else get_broadcast_dims(t)
+            for t in (normalized_bwd.bwd_work_desc, normalized_bwd.bwd_work_state, normalized_bwd.bwd_dq_order, normalized_bwd.bwd_dq_order_full)
+        ),
+        normalized_bwd.dkv_block_size,
+        tuple(
+            None if t is None else get_broadcast_dims(t)
+            for t in (normalized_bwd.dkv_done, normalized_bwd.dkv_expected, normalized_bwd.dkv_completed, normalized_bwd.dkv_completed_count)
+        ),
+        normalized_bwd.comm_block_size,
+        None if normalized_bwd.kv_ready is None else get_broadcast_dims(normalized_bwd.kv_ready),
     )
     api_compile_key = compile_key + (dlse is not None, skip_dkv_postprocess, dk_accum_external is not None)
     if _compiled is not None and _compiled.compile_key != api_compile_key:
@@ -1719,6 +1745,8 @@ def _flex_attn_bwd(
                 sparse_tensor,
                 current_stream,
             ]
+        kernel.comm_block_size = normalized_bwd.comm_block_size
+        kernel.dkv_block_size = normalized_bwd.dkv_block_size
         _flex_attn_bwd.compile_cache[compile_key] = _compile_with_timing(
             *compile_args,
             options=_resolve_bwd_compile_options(

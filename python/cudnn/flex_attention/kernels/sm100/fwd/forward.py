@@ -29,6 +29,7 @@ from cudnn.flex_attention.plan.kernels.packed_mask import (
     softmax_arbitrary_forward_sm100,
     softmax_arbitrary_forward_qstage1_n_direction_sm100,
 )
+from cudnn.flex_attention.kernels.common.communication import wait_kv_ready
 from cudnn.flex_attention.plan.kernels import BlockSparseTensors
 from cudnn.flex_attention.runtime.dsl_utils import assume_tensor_aligned, struct_scalar_ptr
 from cudnn.flex_attention.runtime.logging import flex_log
@@ -1057,6 +1058,9 @@ class _FlexAttentionForwardSm100Base:
                 tKsK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
+                kv_ready=blocksparse_tensors.kv_ready,
+                head_idx_kv=head_idx_kv,
+                valid_tokens=seqlen.seqlen_k,
             )
             load_V = partial(
                 self.load_KV,
@@ -1711,8 +1715,15 @@ class _FlexAttentionForwardSm100Base:
         pipeline_kv: pipeline.PipelineAsync,
         producer_state: pipeline.PipelineState,
         K_or_V: Literal["K", "V"],
+        kv_ready: cute.Tensor | None = None,
+        head_idx_kv: Int32 = 0,
+        valid_tokens: Int32 = 0,
     ):
         assert K_or_V in ("K", "V")
+        if const_expr(kv_ready is not None):
+            # K is issued before V by this same load warp. A ready signal
+            # covers both tensors and the whole logical KV tile across CTAs.
+            wait_kv_ready(kv_ready, head_idx_kv, block * self.n_block_size, self.n_block_size, valid_tokens, self.comm_block_size)
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
         pipeline_kv.producer_acquire(producer_state, extra_tx_count=extra_tx_count_kv)

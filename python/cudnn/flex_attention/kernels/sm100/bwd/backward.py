@@ -26,9 +26,11 @@ from cudnn.flex_attention.plan.kernels.packed_mask import (
     load_mask_payload,
     produce_block_sparse_q_loads_bwd_sm100,
 )
+from cudnn.flex_attention.kernels.common.communication import fence_proxy_async_global, publish_dkv_done, wait_kv_ready
 from cudnn.flex_attention.plan.kernels import BlockSparseTensors
 from cudnn.flex_attention.runtime.dsl_utils import bulk_copy, assume_tensor_aligned, struct_scalar_ptr
 from cudnn.flex_attention.kernels.sm100.bwd.named_barrier import NamedBarrierBwdSm100
+from cudnn.flex_attention.kernels.common.prepared_backward_scheduler import PreparedBackwardScheduler
 from cudnn.flex_attention.kernels.sm100.bwd.backward_config import SM100_BWD_MASK_PAYLOAD_WORDS
 from cudnn.flex_attention.kernels.common.seqlen_info import SeqlenInfoQK
 from cudnn.flex_attention.kernels.common.tile_scheduler import (
@@ -622,9 +624,17 @@ class FlexAttentionBackwardSm100:
             element_size=self.k_dtype.width // 8,
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            # Bound the active Q/dO/dQ working set, independently of physical L2 size.
+            bwd_l2_budget_bytes=50 * 1024 * 1024,
         )
 
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        if const_expr(blocksparse_tensors.bwd_work_desc is not None):
+            TileScheduler = PreparedBackwardScheduler
+            tile_sched_params = TileScheduler.to_underlying_arguments(
+                blocksparse_tensors.bwd_work_desc, blocksparse_tensors.bwd_work_state, self.cta_group_size
+            )
+        else:
+            tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
@@ -1573,6 +1583,15 @@ class FlexAttentionBackwardSm100:
             head_idx_kv = head_idx // self.qhead_per_kvhead
             n_block_cta_group = n_block // self.cta_group_size
             n_block_sparse = n_block_cta_group if const_expr(self.use_2cta_instrs) else n_block
+            if const_expr(blocksparse_tensors.kv_ready is not None):
+                wait_kv_ready(
+                    blocksparse_tensors.kv_ready,
+                    head_idx_kv,
+                    n_block_cta_group * self.tile_n * self.cta_group_size,
+                    self.tile_n * self.cta_group_size,
+                    seqlen.seqlen_k,
+                    self.comm_block_size,
+                )
             n_blocks_per_sample = cute.ceil_div(seqlen.seqlen_k, self.tile_n * self.cta_group_size)
 
             # GMEM tensors (varlen-aware)
@@ -3019,6 +3038,31 @@ class FlexAttentionBackwardSm100:
                                             zero,
                                             tdVgdV[None, i, j],
                                         )
+
+            if const_expr(blocksparse_tensors.dkv_done is not None):  # noqa: SIM102 - static optional signal ABI
+                if process_tile:
+                    # Every issuing warp drains both K and V writes, including
+                    # async FP32 reductions. The publisher must observe both
+                    # compute warpgroups before releasing a communication tile.
+                    if const_expr(self.use_tma_store):  # noqa: SIM102 - static epilogue specialization
+                        if cute.arch.warp_idx() % 4 == 0:
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0, read=False)
+                            with cute.arch.elect_one():
+                                fence_proxy_async_global()
+                    self.compute_sync_barrier.arrive_and_wait()
+                    if tidx == 0:
+                        publish_dkv_done(
+                            blocksparse_tensors.dkv_done,
+                            blocksparse_tensors.dkv_expected,
+                            blocksparse_tensors.dkv_completed,
+                            blocksparse_tensors.dkv_completed_count,
+                            head_idx // self.qhead_per_kvhead,
+                            n_block * self.tile_n,
+                            self.tile_n,
+                            seqlen.seqlen_k,
+                            self.dkv_block_size,
+                        )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()

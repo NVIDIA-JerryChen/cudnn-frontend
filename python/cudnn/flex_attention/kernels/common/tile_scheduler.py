@@ -499,6 +499,7 @@ class TileSchedulerArguments(ParamsBase):
     element_size: cutlass.Constexpr[int] = 2
     lpt: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
+    bwd_l2_budget_bytes: cutlass.Constexpr[int] = 40 * 1024 * 1024
 
 
 class SingleTileScheduler:
@@ -695,7 +696,7 @@ class SingleTileLPTBwdScheduler:
         @staticmethod
         @cute.jit
         def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "SingleTileLPTBwdScheduler.Params":
-            size_l2 = 40 * 1024 * 1024
+            size_l2 = args.bwd_l2_budget_bytes
             size_one_qdo_head = cutlass.Int64(args.seqlen_k) * (args.headdim + args.headdim_v) * args.element_size
             size_one_dqaccum_head = cutlass.Int64(args.seqlen_k) * args.headdim * 4
             size_one_head = size_one_qdo_head + size_one_dqaccum_head

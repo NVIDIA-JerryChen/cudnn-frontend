@@ -331,3 +331,55 @@ native physical KV tile. This cold operation derives the mapping through the
 native postprocess, checks bijectivity, and synchronizes; call it during
 preparation, before capture. The caller owns the returned tensors and applies
 scaling/casting when consuming the accumulators.
+
+## Communication readiness
+
+`plan.with_kv_ready(ready, block_size=...)` creates a plan view bound to caller-owned
+int32 `[Hkv, ceil(K / block_size)]` signals. Both forward and backward acquire every
+communication block intersecting a KV load, including both halves of a 2-CTA
+backward cluster. Reset signals before reuse and publish a nonzero value only after
+both K and V are visible with system release ordering. Signal storage must outlive
+execution. The caller must ensure the producers can make progress while consumers
+wait; this API does not reserve SMs or launch transport kernels.
+
+This interface supports fixed-length batch size 1 with SM90 and the generic
+SM100/SM103 kernels (excluding Blackwell D256). Other configurations fail during preparation.
+Binding signals does not change the mask topology or take ownership away from the
+caller. Explicit executors must be compiled with the bound plan.
+
+`plan.dkv_producer_counts(block_size=...)` prepares int32 `[Hkv, blocks]` counts
+from the native backward topology. Active 2-CTA clusters produce both physical
+halves; the nonexistent partner of an odd tail does not contribute. Communication
+block sizes must divide or be a multiple of the physical kernel KV tile.
+SM90 also counts inactive tasks: their zero epilogues still write the output or
+accumulator and must finish before publication.
+
+`plan.with_dkv_done(done, block_size=..., expected=None, completed=None,
+completed_count=None)` binds backward completion counters. Each physical CTA
+increments `done` with system acquire/release ordering after all compute
+warpgroups have finished all dK/dV stores or FP32 asynchronous reductions. GQA
+publishes the native external accumulators, before scale/cast; callers must declare
+these accumulators explicitly. MHA with a direct output epilogue publishes dK/dV.
+
+The optional `expected`, `completed`, and `completed_count` must be supplied
+together. The last writer increments its block's completion flag and the total
+completed-block counter. Initialize zero-producer flags/counts before launching;
+reset all mutable counters between invocations. This mechanism is independent of
+the deterministic dQ writer semaphores. The same architecture restrictions
+as KV readiness apply.
+
+`plan.backward_block_size` reports the native logical Q/KV spans, including
+cooperative CTA grouping. `plan.with_backward_work_order(work, state)` binds a
+complete permutation of int32 `[KV cluster, Q head, batch]` descriptors and
+rebuilds deterministic dQ tickets from that order. Q heads belonging to the same
+KV head must retain ascending order within each cluster. This is a preparation
+operation and copies compact topology to the host; execution performs no host
+readback.
+
+Before every execution, initialize the caller-owned int32 `state[1 + tasks]`
+with cursor `state[0] = 0` and assignment slots `state[1:] = -1`. A resident CTA
+cluster claims one descriptor and shares that assignment across its roles and
+partner CTA. Dependencies therefore follow resident or completed work rather
+than physical CUDA block launch order. The caller still owns transport progress
+and resource reservation. This interface has the same platform restrictions as
+KV readiness.
