@@ -3548,11 +3548,14 @@ class FlexAttentionBackwardSm100:
                 else:
                     with cute.arch.elect_one():
                         reduce_copy_bytes = self.tma_copy_bytes["dKacc"] if const_expr(K_or_V == "K") else self.tma_copy_bytes["dVacc"]
-                        copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV.iterator,
-                            gdKV_epi[None, epi_stage].iterator,
-                            reduce_copy_bytes,
-                        )
+                        # The partner of an odd final KV tile still participates
+                        # in the cluster pipeline, but owns no accumulator rows.
+                        if n_block * self.tile_n < seqlen.seqlen_k:
+                            copy_utils.cpasync_reduce_bulk_add_f32(
+                                sdKV.iterator,
+                                gdKV_epi[None, epi_stage].iterator,
+                                reduce_copy_bytes,
+                            )
                 if const_expr(epi_stage < num_epi_stages - 1):
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0, read=read_flag)

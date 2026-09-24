@@ -384,6 +384,9 @@ class FlexAttentionBwd(APIBase):
         sample_dlse: Optional[torch.Tensor] = None,
         *,
         deterministic: bool = False,
+        sample_dk_accum: torch.Tensor | None = None,
+        sample_dv_accum: torch.Tensor | None = None,
+        skip_dkv_postprocess: bool = False,
     ) -> None:
         super().__init__()
         _validate_plan(sample_mask_plan)
@@ -399,10 +402,19 @@ class FlexAttentionBwd(APIBase):
             ("dk", sample_dk),
             ("dv", sample_dv),
             ("dlse", sample_dlse),
+            ("dk_accum", sample_dk_accum),
+            ("dv_accum", sample_dv_accum),
         ):
             setattr(self, f"{name}_desc", self._make_tensor_desc(tensor, name=name))
             setattr(self, f"_sample_{name}", tensor)
         self._sample_mask_plan = sample_mask_plan
+        if (sample_dk_accum is None) != (sample_dv_accum is None):
+            raise ValueError("both external dK/dV accumulators are required")
+        if type(skip_dkv_postprocess) is not bool:
+            raise TypeError("skip_dkv_postprocess must be a bool")
+        if skip_dkv_postprocess and sample_dk_accum is None:
+            raise ValueError("skip_dkv_postprocess requires caller-owned accumulators")
+        self.skip_dkv_postprocess = skip_dkv_postprocess
         self.deterministic = deterministic
         self.workspace_size = 0
 
@@ -431,6 +443,9 @@ class FlexAttentionBwd(APIBase):
             _native_inputs=True,
             _validate_only=validate_only,
             _compile_outputs=compile_outputs,
+            dk_accum_external=runtime.get("dk_accum"),
+            dv_accum_external=runtime.get("dv_accum"),
+            skip_dkv_postprocess=self.skip_dkv_postprocess,
         )
 
     def check_support(self) -> bool:
@@ -461,6 +476,8 @@ class FlexAttentionBwd(APIBase):
             do=self._sample_do,
             lse=self._sample_lse,
             dlse=self._sample_dlse,
+            dk_accum=self._sample_dk_accum,
+            dv_accum=self._sample_dv_accum,
             mask_plan=self._sample_mask_plan,
         )
         self._is_supported = True
@@ -480,11 +497,13 @@ class FlexAttentionBwd(APIBase):
             do=self._sample_do,
             lse=self._sample_lse,
             dlse=self._sample_dlse,
+            dk_accum=self._sample_dk_accum,
+            dv_accum=self._sample_dv_accum,
             mask_plan=self._sample_mask_plan,
         )
         self._compiled_kernel = compiled
         self.workspace_size = _workspace_bytes(compiled.workspace_specs)
-        for name in ("q", "k", "v", "o", "do", "lse", "dq", "dk", "dv", "dlse"):
+        for name in ("q", "k", "v", "o", "do", "lse", "dq", "dk", "dv", "dlse", "dk_accum", "dv_accum"):
             setattr(self, f"_sample_{name}", None)
         self._sample_mask_plan = None
 
@@ -508,6 +527,8 @@ class FlexAttentionBwd(APIBase):
         dlse_tensor: Optional[torch.Tensor] = None,
         *,
         workspace: Optional[torch.Tensor],
+        dk_accum_tensor: torch.Tensor | None = None,
+        dv_accum_tensor: torch.Tensor | None = None,
         softmax_scale: Optional[float] = None,
         current_stream: Optional[cuda.CUstream | torch.cuda.Stream] = None,
     ) -> None:
@@ -526,6 +547,8 @@ class FlexAttentionBwd(APIBase):
             "dk": dk_tensor,
             "dv": dv_tensor,
             "dlse": dlse_tensor,
+            "dk_accum": dk_accum_tensor,
+            "dv_accum": dv_accum_tensor,
         }
         for name, tensor in runtime_tensors.items():
             _validate_runtime_tensor(tensor, getattr(self, f"{name}_desc"), name, align_bytes=4 if name in ("lse", "dlse") else align_bytes)
@@ -543,6 +566,8 @@ class FlexAttentionBwd(APIBase):
                 do=do_tensor,
                 lse=lse_tensor,
                 dlse=dlse_tensor,
+                dk_accum=dk_accum_tensor,
+                dv_accum=dv_accum_tensor,
                 softmax_scale=scale,
                 mask_plan=mask_plan,
             )
@@ -558,6 +583,8 @@ class FlexAttentionBwd(APIBase):
                 dk_tensor,
                 dv_tensor,
                 dlse_tensor,
+                dk_accum_tensor,
+                dv_accum_tensor,
                 workspace,
                 *_plan_tensors(mask_plan),
             ),

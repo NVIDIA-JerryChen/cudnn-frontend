@@ -299,3 +299,35 @@ multiple disjoint interval plans are combined by a caller. LSE remains FP32
 with layout `[B, Hq, Sq]` for fixed-length inputs. The output dtype is part of
 the compiled kernel cache key. The high-level wrapper retains its input-dtype
 output convention.
+
+### Caller-owned backward accumulators
+
+`FlexAttentionBwd` accepts the paired `sample_dk_accum` / `sample_dv_accum`
+declarations and the matching `dk_accum_tensor` / `dv_accum_tensor` execute
+arguments. These are contiguous FP32 tensors in the native backward accumulator
+layout, reset by every execute. They replace the internal accumulator workspace;
+passing only one tensor, changing its descriptor, or supplying one without a
+matching compile declaration raises an error.
+
+With `skip_dkv_postprocess=True`, dQ is finalized normally while dK/dV remain
+in these accumulators. The supplied dK/dV output buffers are untouched. A caller
+must interpret the architecture's native accumulator layout and apply
+`softmax_scale` to dK when finalizing; dV needs no additional scale. This is the
+contract for a communication finalizer, not a row-major FP32 gradient output.
+
+For fixed-length SM100/SM103 GQA, the external shape is
+`[B, Hkv, ceil(Skv / tile_n) * tile_n * round_up(D, 16)]`, separately for Dqk
+and Dv. An odd final 2CTA cluster does not add a logical KV tile to this shape:
+its inactive partner participates in synchronization but does not write global
+accumulator memory. `check_support()` validates these shapes before compilation.
+The current integration tests cover D128 on SM100; other configurations retain
+their native validation and require platform-specific verification.
+
+`plan.dkv_accumulator_permutations(block_size=...)` exports the two int32 device
+index tensors for a communication block. Each maps natural `[token, column]`
+order to scalar offsets in the corresponding native FP32 accumulator. Columns
+include padding to a multiple of 16. The block size must be a multiple of the
+native physical KV tile. This cold operation derives the mapping through the
+native postprocess, checks bijectivity, and synchronizes; call it during
+preparation, before capture. The caller owns the returned tensors and applies
+scaling/casting when consuming the accumulators.

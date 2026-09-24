@@ -599,6 +599,75 @@ class MaskPlan:
     def metadata(self) -> MaskPlanMetadata:
         return self._metadata
 
+    def dkv_accumulator_permutations(self, *, block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return natural-to-native scalar indices for one external dK/dV block.
+
+        The caller owns these int32 device tensors. This preparation-only
+        operation derives the layout from the native postprocess, synchronizes,
+        and checks that each mapping is bijective. It is not capture-safe.
+        """
+        from cudnn.flex_attention.dispatch import _get_bwd_postprocess_kernel, torch2cute_dtype_map
+        from cudnn.flex_attention.kernels.sm90.bwd.backward_config import resolve_sm90_bwd_consumer_config
+        from cudnn.flex_attention.kernels.sm100.bwd.backward_config import resolve_sm100_bwd_consumer_config
+
+        metadata = self.metadata
+        if self._packed_plan.bwd_tensors is None:
+            raise ValueError("accumulator layout requires a plan built with backward metadata")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("accumulator layout must be prepared before CUDA Graph capture")
+        if metadata.mode != "fixed" or metadata.arch not in (90, 100, 103):
+            raise NotImplementedError("external accumulator layouts require fixed-length SM90/SM100/SM103 plans")
+        resolver = resolve_sm90_bwd_consumer_config if metadata.arch == 90 else resolve_sm100_bwd_consumer_config
+        config = resolver(
+            arch=metadata.arch,
+            dtype=metadata.dtype,
+            head_dim=metadata.head_dim,
+            head_dim_v=metadata.head_dim_v,
+            num_q_heads=metadata.num_q_heads,
+            num_kv_heads=metadata.num_kv_heads,
+            is_varlen=False,
+        )
+        if type(block_size) is not int or block_size <= 0 or block_size % config.tile_n:
+            raise ValueError(f"accumulator block_size must be a positive multiple of the native KV tile ({config.tile_n})")
+        hopper = metadata.arch == 90
+        atom = config.atom_layout_n_dkv if hopper else 1
+        swap = config.dkv_swap_ab if hopper else False
+        cluster = 1 if hopper else config.cta_group_size
+        outputs = {}
+        for dimension in (metadata.head_dim, metadata.head_dim_v):
+            if dimension in outputs:
+                continue
+            padded = (dimension + 15) // 16 * 16
+            # Export padded rows as well: callers can validate their own compact
+            # stride or select only the live columns, without guessing an MMA layout.
+            total = block_size * padded
+            logical = torch.arange(total, device=metadata.device, dtype=torch.int64)
+            permutation = torch.zeros_like(logical)
+            output = torch.empty((1, block_size, 1, padded), device=metadata.device, dtype=metadata.dtype)
+            post = _get_bwd_postprocess_kernel(
+                torch2cute_dtype_map[metadata.dtype],
+                padded,
+                config.tile_n,
+                256 if hopper else 128,
+                atom,
+                swap,
+                hopper and atom == 1,
+                False,
+                False,
+                cluster,
+                metadata.arch,
+            )
+            # Bit planes remain exact through FP16/BF16; a scalar index ramp would
+            # lose low bits when converted by the native postprocess.
+            for bit in range(max(1, (total - 1).bit_length())):
+                accum = ((logical >> bit) & 1).float().reshape(1, 1, total)
+                post(accum, output, 1.0, None, block_size)
+                permutation |= output.reshape(-1).to(torch.int64) << bit
+            if not torch.equal(permutation.sort().values, logical):
+                raise RuntimeError("native dKV accumulator mapping is not bijective")
+            outputs[dimension] = permutation.to(torch.int32).contiguous()
+        return outputs[metadata.head_dim], outputs[metadata.head_dim_v]
+
     def debug_snapshot(self) -> dict[str, object]:
         """Return cloned tensors for diagnostics without exposing mutable plan state."""
 

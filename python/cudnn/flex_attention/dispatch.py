@@ -1169,6 +1169,9 @@ def _flex_attn_bwd(
     _native_inputs: bool = False,
     _validate_only: bool = False,
     _compile_outputs: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    dk_accum_external: torch.Tensor | None = None,
+    dv_accum_external: torch.Tensor | None = None,
+    skip_dkv_postprocess: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, _CompiledBwd]:
     """Run packed arbitrary-mask backward."""
 
@@ -1401,6 +1404,50 @@ def _flex_attn_bwd(
         atom_layout_m_dq = 1
         dq_single_wg = False
 
+    seqlen_q_rounded = math.ceil(seqlen_q / tile_m) * tile_m
+    seqlen_k_rounded = math.ceil(seqlen_k / tile_n) * tile_n
+    if cluster_size == 2 and (seqlen_k_rounded // tile_n) % 2:
+        seqlen_k_rounded += tile_n
+
+    # Generic SM90/SM100 kernels pad MMA head dimensions to 16 elements.
+    # Keep the flattened accumulator workspace on the same row stride.
+    head_dim_rounded = math.ceil(head_dim / 16) * 16
+    head_dim_v_rounded = math.ceil(head_dim_v / 16) * 16
+    if is_varlen:
+        total_q_padded = (total_q + cu_seqlens_q.shape[0] * tile_m - 1) // tile_m * tile_m
+        dq_accum_shape = None if use_hd256 else (num_q_heads, total_q_padded * head_dim_rounded)
+        dpsum_shape = (num_q_heads, total_q_padded)
+    else:
+        dq_accum_shape = None if use_hd256 else (batch_size, num_q_heads, seqlen_q_rounded * head_dim_rounded)
+        dpsum_shape = (batch_size, num_q_heads, seqlen_q_rounded)
+
+    # The SM100 direct dK/dV epilogue stores full 16-element MMA columns.  Route
+    # padded MHA dimensions through the FP32 workspace as well, so the shared
+    # postprocess owns the final head-dimension predicate.
+    dkv_postprocess = not use_hd256 and (qhead_per_kvhead > 1 or (arch in (100, 103) and (head_dim_rounded != head_dim or head_dim_v_rounded != head_dim_v)))
+    dk_accum_shape = dv_accum_shape = None
+    if dkv_postprocess:
+        if is_varlen:
+            cluster_tile_n = cluster_size * tile_n
+            total_k_padded = (total_k + cu_seqlens_k.shape[0] * cluster_tile_n - 1) // cluster_tile_n * cluster_tile_n
+            dk_accum_shape = (num_kv_heads, total_k_padded * head_dim_rounded)
+            dv_accum_shape = (num_kv_heads, total_k_padded * head_dim_v_rounded)
+        else:
+            dk_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_rounded)
+            dv_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_v_rounded)
+
+    if dk_accum_external is not None or dv_accum_external is not None:
+        if not dkv_postprocess:
+            raise ValueError("external dK/dV accumulators require an accumulator-based backward")
+        if not is_varlen and arch in (100, 103):
+            # An inactive partner CTA must not widen the caller's compact head
+            # stride. Its global stores are suppressed in the kernel epilogue.
+            compact_k = math.ceil(seqlen_k / tile_n) * tile_n
+            dk_accum_shape = (batch_size, num_kv_heads, compact_k * head_dim_rounded)
+            dv_accum_shape = (batch_size, num_kv_heads, compact_k * head_dim_v_rounded)
+        dk_accum = _checked_preallocated(dk_accum_external, "dk_accum_external", dk_accum_shape, torch.float32, q.device)
+        dv_accum = _checked_preallocated(dv_accum_external, "dv_accum_external", dv_accum_shape, torch.float32, q.device)
+
     if _validate_only:
         return None
 
@@ -1427,23 +1474,6 @@ def _flex_attn_bwd(
         dv.zero_()
         return dq, dk, dv
 
-    seqlen_q_rounded = math.ceil(seqlen_q / tile_m) * tile_m
-    seqlen_k_rounded = math.ceil(seqlen_k / tile_n) * tile_n
-    if cluster_size == 2 and (seqlen_k_rounded // tile_n) % 2:
-        seqlen_k_rounded += tile_n
-
-    # Generic SM90/SM100 kernels pad MMA head dimensions to 16 elements.
-    # Keep the flattened accumulator workspace on the same row stride.
-    head_dim_rounded = math.ceil(head_dim / 16) * 16
-    head_dim_v_rounded = math.ceil(head_dim_v / 16) * 16
-    if is_varlen:
-        total_q_padded = (total_q + cu_seqlens_q.shape[0] * tile_m - 1) // tile_m * tile_m
-        dq_accum_shape = None if use_hd256 else (num_q_heads, total_q_padded * head_dim_rounded)
-        dpsum_shape = (num_q_heads, total_q_padded)
-    else:
-        dq_accum_shape = None if use_hd256 else (batch_size, num_q_heads, seqlen_q_rounded * head_dim_rounded)
-        dpsum_shape = (batch_size, num_q_heads, seqlen_q_rounded)
-
     if _preallocated is None:
         dq_accum = torch.empty(dq_accum_shape, dtype=torch.float32, device=q.device) if dq_accum_shape is not None else None
         dpsum = torch.empty(dpsum_shape, dtype=torch.float32, device=q.device)
@@ -1453,27 +1483,13 @@ def _flex_attn_bwd(
         dpsum = _checked_preallocated(_preallocated.dpsum, "dpsum", dpsum_shape, torch.float32, q.device)
         lse_log2 = _checked_preallocated(_preallocated.lse_log2, "lse_log2", dpsum_shape, torch.float32, q.device)
 
-    # The SM100 direct dK/dV epilogue stores full 16-element MMA columns.  Route
-    # padded MHA dimensions through the FP32 workspace as well, so the shared
-    # postprocess owns the final head-dimension predicate.
-    dkv_postprocess = not use_hd256 and (qhead_per_kvhead > 1 or (arch in (100, 103) and (head_dim_rounded != head_dim or head_dim_v_rounded != head_dim_v)))
-    dk_accum_shape = dv_accum_shape = None
-    if dkv_postprocess:
-        if is_varlen:
-            cluster_tile_n = cluster_size * tile_n
-            total_k_padded = (total_k + cu_seqlens_k.shape[0] * cluster_tile_n - 1) // cluster_tile_n * cluster_tile_n
-            dk_accum_shape = (num_kv_heads, total_k_padded * head_dim_rounded)
-            dv_accum_shape = (num_kv_heads, total_k_padded * head_dim_v_rounded)
+    if dk_accum_external is None:
+        if _preallocated is None:
+            dk_accum = torch.zeros(dk_accum_shape, dtype=torch.float32, device=q.device) if dk_accum_shape is not None else None
+            dv_accum = torch.zeros(dv_accum_shape, dtype=torch.float32, device=q.device) if dv_accum_shape is not None else None
         else:
-            dk_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_rounded)
-            dv_accum_shape = (batch_size, num_kv_heads, seqlen_k_rounded * head_dim_v_rounded)
-
-    if _preallocated is None:
-        dk_accum = torch.zeros(dk_accum_shape, dtype=torch.float32, device=q.device) if dk_accum_shape is not None else None
-        dv_accum = torch.zeros(dv_accum_shape, dtype=torch.float32, device=q.device) if dv_accum_shape is not None else None
-    else:
-        dk_accum = _checked_preallocated(_preallocated.dk_accum, "dk_accum", dk_accum_shape, torch.float32, q.device)
-        dv_accum = _checked_preallocated(_preallocated.dv_accum, "dv_accum", dv_accum_shape, torch.float32, q.device)
+            dk_accum = _checked_preallocated(_preallocated.dk_accum, "dk_accum", dk_accum_shape, torch.float32, q.device)
+            dv_accum = _checked_preallocated(_preallocated.dv_accum, "dv_accum", dv_accum_shape, torch.float32, q.device)
 
     dtype = torch2cute_dtype_map[q.dtype]
     preprocess_kernel = (
@@ -1565,7 +1581,7 @@ def _flex_attn_bwd(
         get_broadcast_dims(dv),
         use_hd256,
     )
-    api_compile_key = compile_key + (dlse is not None,)
+    api_compile_key = compile_key + (dlse is not None, skip_dkv_postprocess, dk_accum_external is not None)
     if _compiled is not None and _compiled.compile_key != api_compile_key:
         raise ValueError("runtime tensors, plan, or options do not match the compiled Flex Attention backward configuration")
     if _compiled is None and compile_key not in _flex_attn_bwd.compile_cache:
@@ -1817,7 +1833,7 @@ def _flex_attn_bwd(
         )
         if not _compile_only and not is_fake_mode():
             post_dq_kernel(dq_accum, dq, softmax_scale, cu_seqlens_q, resolved_max_q)
-        if dkv_postprocess:
+        if dkv_postprocess and not skip_dkv_postprocess:
             accum_row_major = arch == 90 and atom_layout_n_dkv == 1
             post_dk_kernel = (
                 _compiled.post_dk
@@ -1868,8 +1884,8 @@ def _flex_attn_bwd(
             ("dq_accum", dq_accum_shape, torch.float32),
             ("dpsum", dpsum_shape, torch.float32),
             ("lse_log2", dpsum_shape, torch.float32),
-            ("dk_accum", dk_accum_shape, torch.float32),
-            ("dv_accum", dv_accum_shape, torch.float32),
+            ("dk_accum", dk_accum_shape if dk_accum_external is None else None, torch.float32),
+            ("dv_accum", dv_accum_shape if dv_accum_external is None else None, torch.float32),
             ("dq_semaphore", dq_semaphore_shape, torch.int32),
             ("dk_semaphore", dk_semaphore_shape, torch.int32),
             ("dv_semaphore", dk_semaphore_shape, torch.int32),
