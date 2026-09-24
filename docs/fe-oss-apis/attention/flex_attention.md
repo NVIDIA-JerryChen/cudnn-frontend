@@ -244,6 +244,23 @@ and workspace.
 compiled-object caches, and autograd state. Explicit backward requires the LSE
 produced by forward and a plan built with backward metadata.
 
+## Offline compilation
+
+For descriptor-only compilation on a host without a CUDA device, construct the
+sample tensors and plans inside PyTorch `FakeTensorMode` and set
+`FLEX_ATTENTION_ARCH=sm_100a` (or the supported target's `CUTE_DSL_ARCH`).
+The explicit target applies only in fake mode; normal execution still checks
+the physical device. `with_backward_work_order` creates ticket descriptors in
+fake mode; real sparse topology and ticket validation still run when preparing
+the execution plan.
+
+Enable `FLEX_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` and set
+`FLEX_ATTENTION_CUTE_DSL_CACHE_DIR` before importing FlexAttention to persist
+compiled functions. Reuse the same source and compatible Linux, Python, DSL,
+and FFI environment. Compilation alone does not validate the runtime mask,
+communication schedule, numerical results, or target hardware; validate those
+with real tensors before accepting a new artifact set.
+
 ## Supported configurations and current limits
 
 - FP16 and BF16 inputs; FP32 LSE

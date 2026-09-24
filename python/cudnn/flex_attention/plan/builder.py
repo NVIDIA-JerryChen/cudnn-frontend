@@ -771,7 +771,7 @@ def _build_forward_schedule(
         dtype=torch.int32,
         device=device,
     )
-    if is_fake_mode() or num_forward_tasks == 0:
+    if num_forward_tasks == 0:
         if needs_sequence_desc and not is_fake_mode():
             assert sequence_desc is not None
             if config.is_varlen:
@@ -836,26 +836,27 @@ def _build_forward_schedule(
         task_cost,
         section_id,
     )
-    schedule(
-        partial_counts,
-        full_counts,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        cu_total_m_blocks,
-        sequence_desc,
-        work_desc,
-        task_cost,
-        section_id,
-        Int32(batch_size),
-        Int32(num_scheduled_heads),
-        Int32(config.num_kv_heads),
-        Int32(seqlen_q_fixed),
-        Int32(seqlen_k_fixed),
-        Int32(max_m_blocks),
-        Int32(head_dim),
-        Int32(head_dim_v),
-        Int32(element_size),
-    )
+    if not is_fake_mode():
+        schedule(
+            partial_counts,
+            full_counts,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_total_m_blocks,
+            sequence_desc,
+            work_desc,
+            task_cost,
+            section_id,
+            Int32(batch_size),
+            Int32(num_scheduled_heads),
+            Int32(config.num_kv_heads),
+            Int32(seqlen_q_fixed),
+            Int32(seqlen_k_fixed),
+            Int32(max_m_blocks),
+            Int32(head_dim),
+            Int32(head_dim_v),
+            Int32(element_size),
+        )
     num_sections = batch_size * config.num_kv_heads
     section_order = torch.empty((num_sections,), dtype=torch.int32, device=device)
     positive_base = torch.empty_like(section_order)
@@ -874,24 +875,25 @@ def _build_forward_schedule(
         sorted_work_desc,
         cu_total_m_blocks,
     )
-    order_schedule(
-        work_desc,
-        task_cost,
-        section_id,
-        schedule_histogram,
-        schedule_section_cost,
-        section_order,
-        positive_base,
-        zero_base,
-        sorted_work_desc,
-        cu_total_m_blocks,
-        Int32(num_forward_tasks),
-        Int32(batch_size),
-        Int32(num_scheduled_heads),
-        Int32(config.num_kv_heads),
-        Int32(max_m_blocks),
-        Int32(max_task_cost),
-    )
+    if not is_fake_mode():
+        order_schedule(
+            work_desc,
+            task_cost,
+            section_id,
+            schedule_histogram,
+            schedule_section_cost,
+            section_order,
+            positive_base,
+            zero_base,
+            sorted_work_desc,
+            cu_total_m_blocks,
+            Int32(num_forward_tasks),
+            Int32(batch_size),
+            Int32(num_scheduled_heads),
+            Int32(config.num_kv_heads),
+            Int32(max_m_blocks),
+            Int32(max_task_cost),
+        )
     return sequence_desc, sorted_work_desc
 
 
@@ -1464,23 +1466,23 @@ def _build_packed_mask_plan(
         )
         bwd_full_counts_tmp = torch.empty_like(bwd_partial_counts_tmp)
 
+    workspace_init = _compile_plan_workspace_init(
+        arch,
+        visible_bits,
+        full_bits,
+        partial_counts_tmp,
+        full_counts_tmp,
+        interval_invalid,
+        schedule_histogram,
+        schedule_section_cost,
+        bwd_visible_bits,
+        bwd_full_bits,
+        bwd_q_partial_counts_tmp,
+        bwd_q_full_counts_tmp,
+        bwd_partial_counts_tmp,
+        bwd_full_counts_tmp,
+    )
     if not is_fake_mode():
-        workspace_init = _compile_plan_workspace_init(
-            arch,
-            visible_bits,
-            full_bits,
-            partial_counts_tmp,
-            full_counts_tmp,
-            interval_invalid,
-            schedule_histogram,
-            schedule_section_cost,
-            bwd_visible_bits,
-            bwd_full_bits,
-            bwd_q_partial_counts_tmp,
-            bwd_q_full_counts_tmp,
-            bwd_partial_counts_tmp,
-            bwd_full_counts_tmp,
-        )
         workspace_init(
             visible_bits,
             full_bits,
@@ -1612,15 +1614,7 @@ def _build_packed_mask_plan(
     fixed_dq_full_offsets = None
     use_fixed_scan_header = not metadata["is_varlen"] and fwd_max_n_blocks > 0
     use_varlen_scan_header = metadata["is_varlen"] and fwd_max_n_blocks > 0
-    if is_fake_mode():
-        total_m_blocks = fwd_upper_total_m_blocks
-        partial_nnz = metadata["hmask"] * fwd_upper_total_m_blocks * fwd_max_n_blocks
-        full_nnz = 0
-        bwd_total_m_blocks = bwd_upper_total_m_blocks
-        bwd_total_n_blocks = bwd_upper_total_n_blocks
-        bwd_partial_nnz = metadata["hmask"] * bwd_upper_total_n_blocks * bwd_max_m_blocks
-        bwd_full_nnz = 0
-    elif use_fixed_scan_header:
+    if use_fixed_scan_header:
         fixed_partial_offsets = torch.empty((partial_counts_tmp.numel() + 1,), dtype=torch.int32, device=device)
         fixed_full_offsets = torch.empty_like(fixed_partial_offsets)
         if bwd_config is not None:
@@ -1658,6 +1652,15 @@ def _build_packed_mask_plan(
             interval_invalid,
             header,
         )
+    if is_fake_mode():
+        total_m_blocks = fwd_upper_total_m_blocks
+        partial_nnz = metadata["hmask"] * fwd_upper_total_m_blocks * fwd_max_n_blocks
+        full_nnz = 0
+        bwd_total_m_blocks = bwd_upper_total_m_blocks
+        bwd_total_n_blocks = bwd_upper_total_n_blocks
+        bwd_partial_nnz = metadata["hmask"] * bwd_upper_total_n_blocks * bwd_max_m_blocks
+        bwd_full_nnz = 0
+    elif use_fixed_scan_header:
         fixed_scan_header(
             partial_counts_tmp,
             full_counts_tmp,

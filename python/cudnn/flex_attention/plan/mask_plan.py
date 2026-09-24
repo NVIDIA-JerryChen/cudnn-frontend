@@ -811,6 +811,22 @@ class MaskPlan:
         for name, tensor, shape in (("work", work, (tasks, 3)), ("state", state, (tasks + 1,))):
             if tensor.device != metadata.device or tensor.dtype != torch.int32 or tuple(tensor.shape) != shape or not tensor.is_contiguous():
                 raise ValueError(f"{name} requires contiguous int32 {shape} on the plan device")
+        from cudnn.flex_attention.runtime.fake_tensor import is_fake_mode
+
+        if is_fake_mode():
+            # Compilation consumes descriptors; tickets are materialized from
+            # the real sparse topology when the runtime plan is prepared.
+            bound = copy.copy(self)
+            order_heads = heads if packed.mask_block_cnt.shape[0] == 1 else 1
+            bound._packed_plan = self._packed_plan._replace(
+                bwd_tensors=packed._replace(
+                    bwd_work_desc=work.clone(),
+                    bwd_work_state=state,
+                    bwd_dq_order=torch.empty((order_heads, packed.mask_block_idx.numel()), dtype=torch.int32, device=metadata.device),
+                    bwd_dq_order_full=torch.empty((order_heads, packed.full_block_idx.numel()), dtype=torch.int32, device=metadata.device),
+                )
+            )
+            return bound
         descriptors = [tuple(row) for row in work.cpu().tolist()]
         wanted = {(cluster, head, 0) for cluster in range(clusters) for head in range(heads)}
         if set(descriptors) != wanted:
