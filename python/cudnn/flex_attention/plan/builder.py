@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import os
 import re
@@ -1142,6 +1143,7 @@ def _build_packed_mask_plan(
     pack_gqa: bool | None = None,
     build_backward: bool = False,
     _fwd_variant: _Sm100FwdVariant | None = None,
+    backward_head_pack: int = 1,
 ) -> BlockSparseTensorsTorch:
     """Build the internal consumer-specific packed-mask payloads."""
 
@@ -1163,6 +1165,12 @@ def _build_packed_mask_plan(
         max_seqlen_q,
         max_seqlen_k,
     )
+    if backward_head_pack != 1:
+        # Only planner metadata is expanded; Q/K/V storage is never transformed.
+        for name in ("seqlen_q_fixed", "total_q", "max_seqlen_q"):
+            metadata[name] *= backward_head_pack
+        arbitrary_func = arbitrary_func.repeat_interleave(backward_head_pack, dim=-1)
+    num_q_heads = q.shape[-2] // backward_head_pack
     runtime_binding = ArbitraryPlanRuntimeBinding.capture(
         is_varlen=metadata["is_varlen"],
         batch_size=metadata["batch_size"],
@@ -1184,7 +1192,7 @@ def _build_packed_mask_plan(
             dtype=q.dtype,
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
-            num_q_heads=q.shape[-2],
+            num_q_heads=num_q_heads,
             num_kv_heads=k.shape[-2],
             is_varlen=metadata["is_varlen"],
             hmask=metadata["hmask"],
@@ -1196,7 +1204,7 @@ def _build_packed_mask_plan(
                 dtype=q.dtype,
                 head_dim=q.shape[-1],
                 head_dim_v=v.shape[-1],
-                num_q_heads=q.shape[-2],
+                num_q_heads=num_q_heads,
                 num_kv_heads=k.shape[-2],
                 is_varlen=metadata["is_varlen"],
             )
@@ -1214,7 +1222,7 @@ def _build_packed_mask_plan(
                 dtype=q.dtype,
                 head_dim=q.shape[-1],
                 head_dim_v=v.shape[-1],
-                num_q_heads=q.shape[-2],
+                num_q_heads=num_q_heads,
                 num_kv_heads=k.shape[-2],
                 is_varlen=metadata["is_varlen"],
                 hmask=metadata["hmask"],
@@ -1227,7 +1235,7 @@ def _build_packed_mask_plan(
                     dtype=q.dtype,
                     head_dim=q.shape[-1],
                     head_dim_v=v.shape[-1],
-                    num_q_heads=q.shape[-2],
+                    num_q_heads=num_q_heads,
                     num_kv_heads=k.shape[-2],
                     is_varlen=metadata["is_varlen"],
                     hmask=metadata["hmask"],
@@ -1242,7 +1250,7 @@ def _build_packed_mask_plan(
                 dtype=q.dtype,
                 head_dim=q.shape[-1],
                 head_dim_v=v.shape[-1],
-                num_q_heads=q.shape[-2],
+                num_q_heads=num_q_heads,
                 num_kv_heads=k.shape[-2],
                 is_varlen=metadata["is_varlen"],
                 hmask=metadata["hmask"],
@@ -1254,7 +1262,7 @@ def _build_packed_mask_plan(
                 dtype=q.dtype,
                 head_dim=q.shape[-1],
                 head_dim_v=v.shape[-1],
-                num_q_heads=q.shape[-2],
+                num_q_heads=num_q_heads,
                 num_kv_heads=k.shape[-2],
                 is_varlen=metadata["is_varlen"],
                 hmask=metadata["hmask"],
@@ -1266,7 +1274,7 @@ def _build_packed_mask_plan(
                 dtype=q.dtype,
                 head_dim=q.shape[-1],
                 head_dim_v=v.shape[-1],
-                num_q_heads=q.shape[-2],
+                num_q_heads=num_q_heads,
                 num_kv_heads=k.shape[-2],
                 is_varlen=metadata["is_varlen"],
                 hmask=metadata["hmask"],
@@ -1278,7 +1286,7 @@ def _build_packed_mask_plan(
                 dtype=q.dtype,
                 head_dim=q.shape[-1],
                 head_dim_v=v.shape[-1],
-                num_q_heads=q.shape[-2],
+                num_q_heads=num_q_heads,
                 num_kv_heads=k.shape[-2],
                 is_varlen=metadata["is_varlen"],
                 hmask=metadata["hmask"],
@@ -1293,7 +1301,7 @@ def _build_packed_mask_plan(
                     dtype=q.dtype,
                     head_dim=q.shape[-1],
                     head_dim_v=v.shape[-1],
-                    num_q_heads=q.shape[-2],
+                    num_q_heads=num_q_heads,
                     num_kv_heads=k.shape[-2],
                     is_varlen=metadata["is_varlen"],
                 )
@@ -1303,6 +1311,12 @@ def _build_packed_mask_plan(
         fwd_topology_config = _ResolvedSm100Hd256FwdTopologyConfig(fwd_config) if use_hd256_consumer else _ResolvedSm100FwdTopologyConfig(fwd_config)
     else:
         raise NotImplementedError("arbitrary plan building supports SM90/SM100/SM103 only")
+
+    if backward_head_pack != 1 and bwd_config is not None:
+        # Packed (head, query) rows must tile without splitting both modes.
+        query_tile = bwd_config.tile_m
+        if query_tile % backward_head_pack and backward_head_pack % query_tile:
+            raise NotImplementedError(f"PackGQA ratio must divide or be a multiple of the native query tile size ({query_tile})")
 
     qratio = fwd_config.qhead_per_kvhead if fwd_config.pack_gqa else 1
     fwd_plan_tile_m = fwd_config.block_size[0]
@@ -2317,6 +2331,7 @@ def create_mask_plan(
     pack_gqa: bool | None = None,
     build_backward: bool | None = None,
     _fwd_variant: _Sm100FwdVariant | None = None,
+    backward_pack_gqa: bool = False,
 ) -> MaskPlan:
     """Create a reusable architecture-native interval-mask plan.
 
@@ -2329,12 +2344,20 @@ def create_mask_plan(
     arguments switches to flattened THD layouts; the plan clones the prefix
     tensors and owns that geometry. ``build_backward=None`` builds backward
     payloads when autograd is enabled and any sample input requires gradients.
+
+    ``backward_pack_gqa=True`` folds a complete GQA group into the query rows
+    of a backward-only plan. The ratio is inferred from the Q and K head counts
+    and must divide or be a multiple of the native query tile size.
+    This requires fixed B=1, SM100, BF16 D128, contiguous Q and a shared head
+    mask. Execution requires deterministic 2CTA and contiguous O/dO/LSE.
     """
 
     if pack_gqa is not None and type(pack_gqa) is not bool:
         raise TypeError("pack_gqa must be a bool or None")
     if build_backward is not None and type(build_backward) is not bool:
         raise TypeError("build_backward must be a bool or None")
+    if type(backward_pack_gqa) is not bool:
+        raise TypeError("backward_pack_gqa must be a bool")
     geometry = validate_create_mask_plan_inputs(
         mask_func,
         q,
@@ -2347,6 +2370,27 @@ def create_mask_plan(
     )
     if build_backward is None:
         build_backward = torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v))
+    backward_head_pack = geometry.num_q_heads // geometry.num_kv_heads if backward_pack_gqa else 1
+    if backward_pack_gqa:
+        if (
+            geometry.arch != 100
+            or geometry.is_varlen
+            or geometry.batch_size != 1
+            or q.dtype != torch.bfloat16
+            or geometry.head_dim != 128
+            or geometry.head_dim_v != 128
+            or geometry.hmask != 1
+            or not build_backward
+            or not q.is_contiguous()
+        ):
+            raise NotImplementedError("head-packed plans require SM100 BF16 D128 B=1 contiguous queries, shared masks and backward metadata")
+        geometry = replace(
+            geometry,
+            seqlen_q=geometry.seqlen_q * backward_head_pack,
+            total_q=geometry.total_q * backward_head_pack,
+            max_seqlen_q=geometry.max_seqlen_q * backward_head_pack,
+            num_q_heads=geometry.num_q_heads // backward_head_pack,
+        )
     packed_plan = _build_packed_mask_plan(
         mask_func,
         q,
@@ -2359,12 +2403,14 @@ def create_mask_plan(
         pack_gqa=pack_gqa,
         build_backward=build_backward,
         _fwd_variant=_fwd_variant,
+        backward_head_pack=backward_head_pack,
     )
     return MaskPlan(
         packed_plan=packed_plan,
         geometry=geometry,
         dtype=q.dtype,
         device=q.device,
+        backward_head_pack=backward_head_pack,
     )
 
 

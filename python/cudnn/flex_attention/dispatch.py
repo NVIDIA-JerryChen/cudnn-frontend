@@ -845,11 +845,14 @@ def _symbolic_fake_strides(rank: int, divisibility: int):
     return tuple(cute.sym_int64(divisibility=divisibility) for _ in range(rank - 1)) + (1,)
 
 
-def _make_fake_bwd_aux_tensors(dtype, is_varlen: bool):
+def _make_fake_bwd_aux_tensors(dtype, is_varlen: bool, query_head_pack: int = 1):
     sym = cute.sym_int
     divisibility = 128 // dtype.width
     batch, seqlen_q = sym(), sym()
     num_q_heads, head_dim, head_dim_v = sym(), sym(), sym()
+    # Caller tensors retain Hq; packed statistics and accumulators have Hq / pack.
+    # Dispatch validates that relation before binding these symbolic descriptors.
+    workspace_heads = num_q_heads if query_head_pack == 1 else sym()
     total_q = sym()
     q_rounded = sym()
     q_d_rounded = sym()
@@ -868,14 +871,14 @@ def _make_fake_bwd_aux_tensors(dtype, is_varlen: bool):
     )
     if is_varlen:
         lse_shape = (num_q_heads, total_q)
-        lse_log2_shape = (num_q_heads, q_rounded)
-        dpsum_shape = (num_q_heads, q_rounded)
-        dq_accum_shape = (num_q_heads, q_d_rounded)
+        lse_log2_shape = (workspace_heads, q_rounded)
+        dpsum_shape = (workspace_heads, q_rounded)
+        dq_accum_shape = (workspace_heads, q_d_rounded)
     else:
         lse_shape = (batch, num_q_heads, seqlen_q)
-        lse_log2_shape = (batch, num_q_heads, q_rounded)
-        dpsum_shape = (batch, num_q_heads, q_rounded)
-        dq_accum_shape = (batch, num_q_heads, q_d_rounded)
+        lse_log2_shape = (batch, workspace_heads, q_rounded)
+        dpsum_shape = (batch, workspace_heads, q_rounded)
+        dq_accum_shape = (batch, workspace_heads, q_d_rounded)
     lse, lse_log2, dpsum, dq_accum = (
         cute.runtime.make_fake_tensor(
             Float32,
@@ -902,8 +905,9 @@ def _compile_bwd_preprocess(
     has_dlse,
     has_dq_accum,
     use_padded_offsets,
+    query_head_pack=1,
 ):
-    out, dout, _, lse, lse_log2, dpsum, dq_accum = _make_fake_bwd_aux_tensors(dtype, is_varlen)
+    out, dout, _, lse, lse_log2, dpsum, dq_accum = _make_fake_bwd_aux_tensors(dtype, is_varlen, query_head_pack)
     cu_q = cute.runtime.make_fake_tensor(Int32, (cute.sym_int(),), stride=(1,), assumed_align=4) if is_varlen else None
     dlse = cute.runtime.make_fake_tensor(Float32, lse.shape, stride=_symbolic_fake_strides(len(lse.shape), 1), assumed_align=4) if has_dlse else None
     kernel = FlexAttentionBackwardPreprocess(
@@ -912,6 +916,7 @@ def _compile_bwd_preprocess(
         head_dim_v,
         tile_m,
         use_padded_offsets=use_padded_offsets,
+        query_head_pack=query_head_pack,
     )
     return _compile_with_timing(
         kernel,
@@ -978,6 +983,7 @@ def _get_bwd_preprocess_kernel(
     has_dlse,
     has_dq_accum,
     use_padded_offsets,
+    query_head_pack=1,
 ):
     compile_key = (
         dtype,
@@ -988,6 +994,7 @@ def _get_bwd_preprocess_kernel(
         has_dlse,
         has_dq_accum,
         use_padded_offsets,
+        query_head_pack,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -1009,8 +1016,9 @@ def _compile_bwd_postprocess(
     use_2cta_instrs,
     cluster_size,
     arch,
+    query_head_pack=1,
 ):
-    _, _, output, _, _, _, accum = _make_fake_bwd_aux_tensors(dtype, is_varlen)
+    _, _, output, _, _, _, accum = _make_fake_bwd_aux_tensors(dtype, is_varlen, query_head_pack)
     cu_q = cute.runtime.make_fake_tensor(Int32, (cute.sym_int(),), stride=(1,), assumed_align=4) if is_varlen else None
     kernel = FlexAttentionBackwardPostprocess(
         dtype,
@@ -1023,6 +1031,7 @@ def _compile_bwd_postprocess(
         accum_row_major,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
+        query_head_pack=query_head_pack,
     )
     return _compile_with_timing(
         kernel,
@@ -1089,6 +1098,7 @@ def _get_bwd_postprocess_kernel(
     use_2cta_instrs,
     cluster_size,
     arch,
+    query_head_pack=1,
 ):
     compile_key = (
         dtype,
@@ -1102,6 +1112,7 @@ def _get_bwd_postprocess_kernel(
         use_2cta_instrs,
         cluster_size,
         arch,
+        query_head_pack,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
@@ -1184,6 +1195,7 @@ def _flex_attn_bwd(
     dk_accum_external: torch.Tensor | None = None,
     dv_accum_external: torch.Tensor | None = None,
     skip_dkv_postprocess: bool = False,
+    query_head_pack: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor, _CompiledBwd]:
     """Run packed arbitrary-mask backward."""
 
@@ -1236,6 +1248,28 @@ def _flex_attn_bwd(
     _validate_tensor(lse, "lse", expected_lse_shape, torch.float32, q.device)
     if dlse is not None:
         _validate_tensor(dlse, "dlse", expected_lse_shape, torch.float32, q.device)
+
+    if type(query_head_pack) is not int or query_head_pack < 1:
+        raise ValueError("query_head_pack must be a positive integer")
+    if query_head_pack != 1:
+        if (
+            query_head_pack != qhead_per_kvhead
+            or arch != 100
+            or is_varlen
+            or batch_size != 1
+            or q.dtype != torch.bfloat16
+            or head_dim != 128
+            or head_dim_v != 128
+            or not deterministic
+        ):
+            raise NotImplementedError("head-packed backward requires fixed SM100 BF16 D128 deterministic complete GQA")
+        if any(not t.is_contiguous() for t in (q, out, dout, lse)):
+            raise ValueError("head-packed backward requires contiguous Q/O/dO/LSE storage")
+        seqlen_q *= query_head_pack
+        total_q *= query_head_pack
+        resolved_max_q *= query_head_pack
+        num_q_heads //= query_head_pack
+        qhead_per_kvhead //= query_head_pack
 
     outer_signature = _validate_plan_binding(
         block_sparse_tensors,
@@ -1395,6 +1429,9 @@ def _flex_attn_bwd(
             raise NotImplementedError("the resolved arbitrary backward plan requires 2CTA")
         cluster_size = 2 if use_2cta else 1
 
+    if query_head_pack != 1 and not use_2cta:
+        raise NotImplementedError("head-packed backward requires the native 2CTA kernel")
+
     if arch == 90:
         tile_m = bwd_config.tile_m
         tile_n = bwd_config.tile_n
@@ -1416,6 +1453,9 @@ def _flex_attn_bwd(
         atom_layout_m_dq = 1
         dq_single_wg = False
 
+    if query_head_pack != 1 and tile_m % query_head_pack and query_head_pack % tile_m:
+        raise NotImplementedError(f"query_head_pack must divide or be a multiple of the native query tile size ({tile_m})")
+
     seqlen_q_rounded = math.ceil(seqlen_q / tile_m) * tile_m
     seqlen_k_rounded = math.ceil(seqlen_k / tile_n) * tile_n
     if cluster_size == 2 and (seqlen_k_rounded // tile_n) % 2:
@@ -1436,7 +1476,11 @@ def _flex_attn_bwd(
     # The SM100 direct dK/dV epilogue stores full 16-element MMA columns.  Route
     # padded MHA dimensions through the FP32 workspace as well, so the shared
     # postprocess owns the final head-dimension predicate.
-    dkv_postprocess = not use_hd256 and (qhead_per_kvhead > 1 or (arch in (100, 103) and (head_dim_rounded != head_dim or head_dim_v_rounded != head_dim_v)))
+    # A packed GQA task still hands FP32 gradients to the caller's finalizer.
+    accumulate_dkv = query_head_pack > 1
+    dkv_postprocess = not use_hd256 and (
+        accumulate_dkv or qhead_per_kvhead > 1 or (arch in (100, 103) and (head_dim_rounded != head_dim or head_dim_v_rounded != head_dim_v))
+    )
     dk_accum_shape = dv_accum_shape = None
     if dkv_postprocess:
         if is_varlen:
@@ -1519,6 +1563,7 @@ def _flex_attn_bwd(
             dlse is not None,
             dq_accum is not None,
             use_hd256,
+            query_head_pack=query_head_pack,
         )
     )
     normalized_bwd = normalize_arbitrary_block_sparse_config_bwd(
@@ -1554,7 +1599,9 @@ def _flex_attn_bwd(
         )
     spt = deterministic and not use_hd256
     dq_semaphore_shape = (batch_size, num_q_heads, seqlen_q_rounded // tile_m, cluster_size) if deterministic and not use_hd256 else None
-    dk_semaphore_shape = (batch_size, num_kv_heads, seqlen_k_rounded // tile_n, 2) if deterministic and qhead_per_kvhead > 1 and not use_hd256 else None
+    dk_semaphore_shape = (
+        (batch_size, num_kv_heads, seqlen_k_rounded // tile_n, 2) if deterministic and (qhead_per_kvhead > 1 or accumulate_dkv) and not use_hd256 else None
+    )
     if _preallocated is None:
         dQ_semaphore = torch.zeros(dq_semaphore_shape, dtype=torch.int32, device=q.device) if dq_semaphore_shape is not None else None
         dK_semaphore = torch.zeros(dk_semaphore_shape, dtype=torch.int32, device=q.device) if dk_semaphore_shape is not None else None
@@ -1606,6 +1653,8 @@ def _flex_attn_bwd(
         ),
         normalized_bwd.comm_block_size,
         None if normalized_bwd.kv_ready is None else get_broadcast_dims(normalized_bwd.kv_ready),
+        query_head_pack,
+        accumulate_dkv,
     )
     api_compile_key = compile_key + (dlse is not None, skip_dkv_postprocess, dk_accum_external is not None)
     if _compiled is not None and _compiled.compile_key != api_compile_key:
@@ -1724,6 +1773,8 @@ def _flex_attn_bwd(
                 use_2cta_instrs=use_2cta,
                 deterministic=deterministic,
                 spt=spt,
+                query_head_pack=query_head_pack,
+                accumulate_dkv=accumulate_dkv,
             )
             compile_args = [
                 kernel,
@@ -1857,6 +1908,7 @@ def _flex_attn_bwd(
                 use_2cta,
                 1,
                 arch,
+                query_head_pack=query_head_pack,
             )
         )
         if not _compile_only and not is_fake_mode():

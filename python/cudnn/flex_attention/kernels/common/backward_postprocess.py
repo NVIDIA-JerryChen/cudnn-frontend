@@ -20,6 +20,7 @@ from cudnn.flex_attention._compat import layout_utils
 from cudnn.flex_attention._compat import sm90_utils
 
 from cudnn.flex_attention.kernels.common import device_utils as utils
+from cudnn.flex_attention.kernels.common.pack_gqa import pack_gqa_layout
 from cudnn.flex_attention.runtime.dsl_utils import assume_tensor_aligned
 from cudnn.flex_attention.kernels.common.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
@@ -44,6 +45,7 @@ class FlexAttentionBackwardPostprocess:
         accum_row_major: bool = False,
         use_2cta_instrs: bool = False,
         cluster_size: int = 1,  # for varlen offsets
+        query_head_pack: int = 1,
     ):
         """
         :param head_dim: head dimension
@@ -51,6 +53,7 @@ class FlexAttentionBackwardPostprocess:
         :param tile_m: m block size
         :type tile_m: int
         """
+        self.query_head_pack = query_head_pack
         self.dtype = dtype
         self.tile_m = tile_m
         assert arch in (90, 100, 103), "Only SM90, SM100, and SM103 are supported"
@@ -172,6 +175,12 @@ class FlexAttentionBackwardPostprocess:
 
         mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
 
+        if const_expr(self.query_head_pack != 1):
+            heads = mdQ.shape[2] // self.query_head_pack
+            mdQ = layout_utils.select(mdQ, [1, 3, 2, 0])
+            mdQ = pack_gqa_layout(mdQ, self.query_head_pack, heads, 2)
+            mdQ = layout_utils.select(mdQ, [3, 0, 2, 1])
+
         self.tiled_mma = self._get_tiled_mma()
         self._setup_attributes()
 
@@ -189,7 +198,7 @@ class FlexAttentionBackwardPostprocess:
             TileScheduler = SingleTileScheduler
             num_head = mdQ.shape[2]
             num_batch = mdQ.shape[0]
-            num_block = cute.ceil_div(mdQ.shape[1], self.tile_m)
+            num_block = cute.ceil_div(cute.size(mdQ.shape[1]), self.tile_m)
 
         tile_sched_args = TileSchedulerArguments(
             num_block=num_block,
@@ -260,7 +269,7 @@ class FlexAttentionBackwardPostprocess:
         if work_tile.is_valid_tile:
             seqlen = SeqlenInfoQK.create(
                 batch_idx,
-                mdQ.shape[1],
+                cute.size(mdQ.shape[1]),
                 0,
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=None,
@@ -345,7 +354,7 @@ class FlexAttentionBackwardPostprocess:
 
             seqlen = SeqlenInfoQK.create(
                 batch_idx,
-                mdQ.shape[1],
+                cute.size(mdQ.shape[1]),
                 0,
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=None,

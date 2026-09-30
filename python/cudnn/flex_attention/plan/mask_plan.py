@@ -546,6 +546,7 @@ class MaskPlanMetadata:
     nfunc: int
     pack_gqa: bool
     has_backward: bool
+    backward_head_pack: int = 1
 
 
 class MaskPlan:
@@ -565,6 +566,7 @@ class MaskPlan:
         geometry: PlanGeometry,
         dtype: torch.dtype,
         device: torch.device,
+        backward_head_pack: int = 1,
     ) -> None:
         signature = validate_arbitrary_attention_plan(
             block_sparse_tensors=packed_plan,
@@ -583,6 +585,7 @@ class MaskPlan:
             max_seqlen_q=geometry.max_seqlen_q,
             max_seqlen_k=geometry.max_seqlen_k,
             num_q_heads=geometry.num_q_heads,
+            backward_head_pack=backward_head_pack,
             num_kv_heads=geometry.num_kv_heads,
             head_dim=geometry.head_dim,
             head_dim_v=geometry.head_dim_v,
@@ -925,14 +928,14 @@ class MaskPlan:
             raise ValueError("q, k, and v must use the MaskPlan CUDA device")
         if any(tensor.dtype != metadata.dtype for tensor in (q, k, v)):
             raise TypeError("q, k, and v must use the MaskPlan dtype")
-        if q.shape[-2:] != (metadata.num_q_heads, metadata.head_dim):
+        if q.shape[-2:] != (metadata.num_q_heads * metadata.backward_head_pack, metadata.head_dim):
             raise ValueError("q head geometry does not match MaskPlan")
         if k.shape[-2:] != (metadata.num_kv_heads, metadata.head_dim):
             raise ValueError("k head geometry does not match MaskPlan")
         if v.shape[-2:] != (metadata.num_kv_heads, metadata.head_dim_v):
             raise ValueError("v head geometry does not match MaskPlan")
         if mode == "fixed":
-            expected_q = (metadata.batch_size, metadata.total_q // metadata.batch_size)
+            expected_q = (metadata.batch_size, metadata.total_q // metadata.batch_size // metadata.backward_head_pack)
             expected_k = (metadata.batch_size, metadata.total_k // metadata.batch_size)
             if q.shape[:2] != expected_q or k.shape[:2] != expected_k or v.shape[:2] != expected_k:
                 raise ValueError("fixed sequence geometry does not match MaskPlan")

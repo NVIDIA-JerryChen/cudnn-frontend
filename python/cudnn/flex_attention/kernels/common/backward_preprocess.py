@@ -25,6 +25,7 @@ from cutlass import Float32, const_expr
 from cudnn.flex_attention._compat import copy_utils, layout_utils
 
 from cudnn.flex_attention.kernels.common import device_utils as utils
+from cudnn.flex_attention.kernels.common.pack_gqa import pack_gqa_layout
 from cudnn.flex_attention.kernels.common.seqlen_info import SeqlenInfo
 from cudnn.flex_attention._compat.cute_dsl_utils import ParamsBase
 from cudnn.flex_attention.kernels.common.tile_scheduler import (
@@ -42,6 +43,7 @@ class FlexAttentionBackwardPreprocess:
         head_dim_v: int,
         tile_m: int = 128,
         use_padded_offsets: bool = True,
+        query_head_pack: int = 1,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -52,6 +54,7 @@ class FlexAttentionBackwardPreprocess:
         :param tile_m: m block size
         :type tile_m: int
         """
+        self.query_head_pack = query_head_pack
         self.dtype = dtype
         self.tile_m = tile_m
         # Accumulator storage must use the same head-dimension padding as the
@@ -129,6 +132,16 @@ class FlexAttentionBackwardPreprocess:
         if const_expr(mdQaccum is not None):
             mdQaccum = layout_utils.select(mdQaccum, transpose)
 
+        if const_expr(self.query_head_pack != 1):
+            heads = mO.shape[2] // self.query_head_pack
+            mO, mdO = [layout_utils.select(t, [1, 3, 2, 0]) for t in (mO, mdO)]
+            mO, mdO = [pack_gqa_layout(t, self.query_head_pack, heads, 2) for t in (mO, mdO)]
+            mO, mdO = [layout_utils.select(t, [3, 0, 2, 1]) for t in (mO, mdO)]
+            if const_expr(mLSE is not None):
+                mLSE = pack_gqa_layout(mLSE, self.query_head_pack, heads, 1)
+            if const_expr(mdLSE is not None):
+                mdLSE = pack_gqa_layout(mdLSE, self.query_head_pack, heads, 1)
+
         if const_expr(mCuSeqlensQ is not None):
             TileScheduler = SingleTileMaxVarlenScheduler
             num_head = mO.shape[1]
@@ -138,7 +151,7 @@ class FlexAttentionBackwardPreprocess:
             TileScheduler = SingleTileScheduler
             num_head = mO.shape[2]
             num_batch = mO.shape[0]
-            num_block = cute.ceil_div(mO.shape[1], self.tile_m)
+            num_block = cute.ceil_div(cute.size(mO.shape[1]), self.tile_m)
 
         tile_sched_args = TileSchedulerArguments(
             num_block=num_block,
@@ -209,7 +222,7 @@ class FlexAttentionBackwardPreprocess:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen = SeqlenInfo.create(batch_idx, mO.shape[1], mCuSeqlensQ, tile=self.tile_m)
+            seqlen = SeqlenInfo.create(batch_idx, cute.size(mO.shape[1]), mCuSeqlensQ, tile=self.tile_m)
             mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]
             mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
             # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets

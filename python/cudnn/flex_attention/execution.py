@@ -78,6 +78,7 @@ def _plan_signature(mask_plan: MaskPlan) -> tuple:
         metadata.head_dim_v,
         metadata.hmask,
         metadata.pack_gqa,
+        metadata.backward_head_pack,
         metadata.has_backward,
         signature(packed_plan),
         signature(getattr(packed_plan, "bwd_tensors", None)),
@@ -227,6 +228,8 @@ class FlexAttentionFwd(APIBase):
     ) -> None:
         super().__init__()
         _validate_plan(sample_mask_plan)
+        if sample_mask_plan.metadata.backward_head_pack != 1:
+            raise ValueError("head-packed backward plans cannot be used for forward")
         self._warn_experimental_api()
         self.q_desc = self._make_tensor_desc(sample_q, name="q")
         self.k_desc = self._make_tensor_desc(sample_k, name="k")
@@ -446,6 +449,7 @@ class FlexAttentionBwd(APIBase):
             dk_accum_external=runtime.get("dk_accum"),
             dv_accum_external=runtime.get("dv_accum"),
             skip_dkv_postprocess=self.skip_dkv_postprocess,
+            query_head_pack=mask_plan.metadata.backward_head_pack,
         )
 
     def check_support(self) -> bool:

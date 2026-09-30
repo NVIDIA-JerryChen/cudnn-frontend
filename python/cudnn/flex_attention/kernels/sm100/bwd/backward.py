@@ -39,6 +39,7 @@ from cudnn.flex_attention.kernels.common.tile_scheduler import (
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
+from cudnn.flex_attention.kernels.common.pack_gqa import pack_gqa_layout
 from cudnn.flex_attention._compat import layout_utils
 from cudnn.flex_attention._compat.cute_dsl_utils import ParamsBase
 
@@ -54,6 +55,8 @@ class FlexAttentionBackwardSm100:
         deterministic: bool = False,
         spt: Optional[bool] = None,
         use_2cta_instrs: bool = False,
+        query_head_pack: int = 1,
+        accumulate_dkv: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -94,6 +97,9 @@ class FlexAttentionBackwardSm100:
         self.cluster_shape_mn = (self.cta_group_size, 1)
         if self.use_2cta_instrs:
             assert (head_dim, head_dim_v) in ((128, 128), (192, 128)), "arbitrary cooperative backward requires " "D/Dv=128/128 or 192/128"
+        self.accumulate_dkv = accumulate_dkv
+        self.ordered_dkv = deterministic and (qhead_per_kvhead > 1 or accumulate_dkv)
+        self.query_head_pack = query_head_pack
         self.qhead_per_kvhead = qhead_per_kvhead
         self.deterministic = deterministic
         self.spt_override = spt
@@ -397,7 +403,7 @@ class FlexAttentionBackwardSm100:
 
         self.is_varlen_k = mCuSeqlensK is not None
         self.is_varlen_q = mCuSeqlensQ is not None
-        self.dKV_postprocess = self.qhead_per_kvhead > 1 or self.check_hdim_oob or self.check_hdim_v_oob
+        self.dKV_postprocess = self.accumulate_dkv or self.qhead_per_kvhead > 1 or self.check_hdim_oob or self.check_hdim_v_oob
         self.use_tma_store = self.dKV_postprocess or not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
 
         if const_expr(self.dKV_postprocess):
@@ -409,6 +415,11 @@ class FlexAttentionBackwardSm100:
         # (b, s, n, h) --> (s, h, n, b) or (t, n, h) -> (t, h, n)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ, mdO = [layout_utils.select(t, mode=QO_layout_transpose) for t in (mQ, mdO)]
+
+        # The logical row is (head % pack, query); TMA reads the caller's
+        # original storage while the sparse plan and accumulator use packed rows.
+        if const_expr(self.query_head_pack != 1):
+            mQ, mdO = [pack_gqa_layout(t, self.query_head_pack, t.shape[2] // self.query_head_pack, 2) for t in (mQ, mdO)]
 
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [layout_utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
@@ -436,7 +447,7 @@ class FlexAttentionBackwardSm100:
             assert mdQ_semaphore is not None
             mdQ_semaphore = layout_utils.select(mdQ_semaphore, mode=semaphore_transpose)
 
-        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
+        if const_expr(self.ordered_dkv):
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [layout_utils.select(t, mode=semaphore_transpose) for t in (mdK_semaphore, mdV_semaphore)]
@@ -1239,7 +1250,7 @@ class FlexAttentionBackwardSm100:
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0],
+            seqlen_q_static=cute.size(mQ.shape[0]),
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
@@ -2944,7 +2955,7 @@ class FlexAttentionBackwardSm100:
                         mdK_semaphore,
                         "K",
                     )
-            if const_expr(self.deterministic and self.dKV_postprocess and self.qhead_per_kvhead > 1):
+            if const_expr(self.ordered_dkv):
                 if not process_tile:
                     # dK/dV accumulation is ordered by Q-head rank within each
                     # KV head.  An empty sparse row contributes zero, but it
@@ -3514,7 +3525,7 @@ class FlexAttentionBackwardSm100:
             gdKV = cute.logical_divide(gdKV_p, (self.tile_n * tile_hdim // num_wg,))[((None, wg_idx),)]  # (tile_n * hdim / 2)
             gdKV_epi = cute.flat_divide(gdKV, (flat_epi_tile,))  # (tile_n * hdim / 2 / epi_stage, epi_stage)
 
-        deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
+        deterministic_KV = self.ordered_dkv
         if const_expr(deterministic_KV):
             assert mdKV_semaphore is not None
             mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]

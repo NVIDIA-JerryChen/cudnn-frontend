@@ -400,3 +400,15 @@ partner CTA. Dependencies therefore follow resident or completed work rather
 than physical CUDA block launch order. The caller still owns transport progress
 and resource reservation. This interface has the same platform restrictions as
 KV readiness.
+
+### Complete-GQA backward packing
+
+`create_mask_plan(..., build_backward=True, backward_pack_gqa=True)` enables
+PackGQA for a backward-only plan. The packing ratio is inferred from the input
+Q and K head counts (`Hq / Hkv`). The option defaults to `False`.
+
+The ratio must divide or be a multiple of the native query tile size (currently
+128 rows). This path requires SM100, BF16, D128, fixed B=1, a shared head mask,
+contiguous Q/O/dO/LSE, and deterministic 2CTA execution. The caller must
+initialize external FP32 dK/dV accumulators before each invocation.
+Compare complete backward calls for the target workload before enabling it.
