@@ -374,9 +374,11 @@ accumulator and must finish before publication.
 `plan.with_dkv_done(done, block_size=..., expected=None, completed=None,
 completed_count=None)` binds backward completion counters. Each physical CTA
 increments `done` with system acquire/release ordering after all compute
-warpgroups have finished all dK/dV stores or FP32 asynchronous reductions. GQA
-publishes the native external accumulators, before scale/cast; callers must declare
-these accumulators explicitly. MHA with a direct output epilogue publishes dK/dV.
+warpgroups have finished all dK/dV stores or FP32 asynchronous reductions. Unpacked
+GQA publishes native external accumulators before scale/cast; callers must declare
+these accumulators explicitly. Complete packed GQA without external accumulators
+uses the direct BF16 output epilogue and publishes final dK/dV, as MHA does. Passing
+external accumulators retains FP32 output and caller-owned finalization.
 
 The optional `expected`, `completed`, and `completed_count` must be supplied
 together. The last writer increments its block's completion flag and the total

@@ -1476,8 +1476,9 @@ def _flex_attn_bwd(
     # The SM100 direct dK/dV epilogue stores full 16-element MMA columns.  Route
     # padded MHA dimensions through the FP32 workspace as well, so the shared
     # postprocess owns the final head-dimension predicate.
-    # A packed GQA task still hands FP32 gradients to the caller's finalizer.
-    accumulate_dkv = query_head_pack > 1
+    # A complete packed group owns its output. Retain FP32 staging only when
+    # the caller explicitly supplies accumulator storage for a finalizer.
+    accumulate_dkv = query_head_pack > 1 and (dk_accum_external is not None or dv_accum_external is not None)
     dkv_postprocess = not use_hd256 and (
         accumulate_dkv or qhead_per_kvhead > 1 or (arch in (100, 103) and (head_dim_rounded != head_dim or head_dim_v_rounded != head_dim_v))
     )
